@@ -517,6 +517,49 @@ function newShoppingItemId() {
   return "s" + Date.now() + Math.random().toString(36).slice(2, 7);
 }
 
+// ---------- grocery section grouping ----------
+// Approximate, keyword-based — there's no way to know for certain that
+// "onion" is produce from free text alone, so this is a best guess, in the
+// order most stores are laid out, not a precise classification.
+
+const GROCERY_SECTIONS = ["Produce", "Dairy & Eggs", "Meat & Seafood", "Bakery", "Frozen", "Pantry", "Other"];
+
+const GROCERY_KEYWORDS = {
+  Produce: [
+    "onion", "garlic", "tomato", "lettuce", "spinach", "kale", "potato", "carrot", "celery",
+    "bell pepper", "cucumber", "zucchini", "broccoli", "cauliflower", "mushroom", "lemon",
+    "lime", "apple", "banana", "avocado", "cilantro", "parsley", "basil", "mint", "dill",
+    "rosemary", "thyme", "scallion", "green onion", "ginger", "corn", "squash", "cabbage",
+    "berries", "strawberr", "grape", "orange", "peach", "pear", "melon",
+  ],
+  "Dairy & Eggs": [
+    "milk", "cheese", "butter", "yogurt", "cream", "sour cream", "egg", "parmesan",
+    "mozzarella", "cheddar", "cotija", "half and half", "cream cheese", "cottage cheese",
+  ],
+  "Meat & Seafood": [
+    "chicken", "beef", "pork", "turkey", "salmon", "shrimp", "fish", "bacon", "sausage",
+    "steak", "tilapia", "cod", "ground beef", "ground turkey", "lamb", "ham",
+  ],
+  Bakery: ["bread", "bun", "tortilla", "bagel", "roll", "pita", "naan", "baguette", "english muffin"],
+  Frozen: ["frozen", "ice cream", "frozen pizza", "frozen peas", "popsicle"],
+  Pantry: [
+    "flour", "sugar", "rice", "pasta", "oil", "vinegar", "canned", "can of", "beans", "broth",
+    "stock", "cumin", "paprika", "garam masala", "cinnamon", "salt", "pepper", "soy sauce",
+    "sesame oil", "tomato paste", "crushed tomatoes", "tomato puree", "panko", "breadcrumb",
+    "honey", "peanut butter", "oats", "cereal", "cracker", "seasoning", "spice", "sauce",
+    "ketchup", "mustard", "mayo", "syrup", "stock", "bouillon", "tortilla chip", "nut",
+  ],
+};
+
+function guessGrocerySection(text) {
+  const lower = text.toLowerCase();
+  for (const section of GROCERY_SECTIONS) {
+    const words = GROCERY_KEYWORDS[section];
+    if (words && words.some((w) => lower.includes(w))) return section;
+  }
+  return "Other";
+}
+
 // Adds https:// if someone pastes a bare domain, so the link still opens correctly.
 function normalizeUrl(url) {
   return /^https?:\/\//i.test(url) ? url : `https://${url}`;
@@ -677,7 +720,9 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
   return (
     <div className="sb-modal-backdrop" onClick={onCancel}>
       <div className="sb-sheet" onClick={(e) => e.stopPropagation()}>
-        <div className="sb-eyebrow">{initial ? "edit recipe card" : "new recipe card"}</div>
+        <button type="button" className="sb-sheet-close" onClick={onCancel} aria-label="Close">
+          ×
+        </button>
         <h2 className="sb-sheet-title">{initial ? "Edit recipe" : "Add a recipe"}</h2>
 
         <label className="sb-field sb-field-wide">
@@ -820,9 +865,6 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
             </button>
           )}
           <div className="sb-sheet-actions-right">
-            <button className="sb-btn-ghost" onClick={onCancel}>
-              cancel
-            </button>
             <button className="sb-btn-solid" disabled={!isValid} onClick={submit}>
               {initial ? "save changes" : "add to recipe box"}
             </button>
@@ -1394,6 +1436,16 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onToggleHaveAtHome, on
   const unchecked = items.filter((i) => !i.checked);
   const checked = items.filter((i) => i.checked);
 
+  const groupedItems = useMemo(() => {
+    const bySection = {};
+    GROCERY_SECTIONS.forEach((s) => (bySection[s] = []));
+    items.forEach((i) => {
+      bySection[guessGrocerySection(i.text)].push(i);
+    });
+    GROCERY_SECTIONS.forEach((s) => bySection[s].sort((a, b) => a.text.localeCompare(b.text)));
+    return GROCERY_SECTIONS.map((s) => ({ section: s, items: bySection[s] })).filter((g) => g.items.length > 0);
+  }, [items]);
+
   return (
     <div className="sb-modal-backdrop" onClick={onClose}>
       <div className="sb-sheet" onClick={(e) => e.stopPropagation()}>
@@ -1461,45 +1513,39 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onToggleHaveAtHome, on
               <span />
               <span />
             </div>
-            <div className="sb-shop-items">
-              {unchecked.map((i) => (
-                <div key={i.id} className="sb-shop-item-row">
-                  <input
-                    type="checkbox"
-                    checked={!!i.haveAtHome}
-                    onChange={() => onToggleHaveAtHome(i.id, !i.haveAtHome)}
-                    aria-label="Already have at home"
-                  />
-                  <input type="checkbox" checked={false} onChange={() => onToggle(i.id, true)} aria-label="Store" />
-                  <span className="sb-shop-item-main">
-                    <span className={"sb-shop-item-text" + (i.haveAtHome ? " sb-shop-item-have" : "")}>{i.text}</span>
-                    {i.sources && i.sources.length > 0 && (
-                      <span className="sb-shop-item-sources">for {i.sources.join(", ")}</span>
-                    )}
-                  </span>
-                  <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
-                    ×
-                  </button>
-                </div>
-              ))}
-              {checked.map((i) => (
-                <div key={i.id} className="sb-shop-item-row sb-shop-item-checked">
-                  <input
-                    type="checkbox"
-                    checked={!!i.haveAtHome}
-                    onChange={() => onToggleHaveAtHome(i.id, !i.haveAtHome)}
-                    aria-label="Already have at home"
-                  />
-                  <input type="checkbox" checked={true} onChange={() => onToggle(i.id, false)} aria-label="Store" />
-                  <span className="sb-shop-item-main">
-                    <span className="sb-shop-item-text">{i.text}</span>
-                    {i.sources && i.sources.length > 0 && (
-                      <span className="sb-shop-item-sources">for {i.sources.join(", ")}</span>
-                    )}
-                  </span>
-                  <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
-                    ×
-                  </button>
+            <div className="sb-shop-groups-scroll">
+              {groupedItems.map(({ section, items: sectionItems }) => (
+                <div key={section} className="sb-shop-section-group">
+                  <div className="sb-shop-section-title">{section}</div>
+                  <div className="sb-shop-items">
+                    {sectionItems.map((i) => (
+                      <div key={i.id} className={"sb-shop-item-row" + (i.checked ? " sb-shop-item-checked" : "")}>
+                        <input
+                          type="checkbox"
+                          className="sb-check sb-check-home"
+                          checked={!!i.haveAtHome}
+                          onChange={() => onToggleHaveAtHome(i.id, !i.haveAtHome)}
+                          aria-label="Already have at home"
+                        />
+                        <input
+                          type="checkbox"
+                          className="sb-check sb-check-store"
+                          checked={!!i.checked}
+                          onChange={() => onToggle(i.id, !i.checked)}
+                          aria-label="Store"
+                        />
+                        <span className="sb-shop-item-main">
+                          <span className={"sb-shop-item-text" + (i.haveAtHome ? " sb-shop-item-have" : "")}>{i.text}</span>
+                          {i.sources && i.sources.length > 0 && (
+                            <span className="sb-shop-item-sources">for {i.sources.join(", ")}</span>
+                          )}
+                        </span>
+                        <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               ))}
             </div>
@@ -2507,14 +2553,16 @@ const BASE_STYLES = `
     display: flex;
     flex-direction: column;
     gap: 2px;
-    margin-bottom: 16px;
-    max-height: 280px;
+  }
+  .sb-shop-groups-scroll {
+    max-height: 300px;
     overflow-y: auto;
+    margin-bottom: 16px;
   }
   .sb-shop-col-headers {
     display: grid;
-    grid-template-columns: 22px 22px 1fr 20px;
-    gap: 10px;
+    grid-template-columns: 40px 40px 1fr 20px;
+    gap: 8px;
     padding: 0 4px 6px;
   }
   .sb-shop-col-label {
@@ -2525,15 +2573,56 @@ const BASE_STYLES = `
     color: #8a8168;
     text-align: center;
   }
+  .sb-shop-section-group { margin-bottom: 10px; }
+  .sb-shop-section-title {
+    font-family: 'Inter', sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--herb);
+    padding: 8px 4px 4px;
+    border-top: 1px solid #E4D6AC;
+  }
+  .sb-shop-section-group:first-child .sb-shop-section-title { border-top: none; padding-top: 0; }
   .sb-shop-item-row {
     display: grid;
-    grid-template-columns: 22px 22px 1fr 20px;
+    grid-template-columns: 40px 40px 1fr 20px;
     align-items: center;
-    gap: 10px;
-    padding: 9px 4px;
+    gap: 8px;
+    padding: 6px 4px;
     border-bottom: 1px solid #E4D6AC;
   }
-  .sb-shop-item-row input[type="checkbox"] { justify-self: center; }
+  .sb-check {
+    appearance: none;
+    -webkit-appearance: none;
+    justify-self: center;
+    width: 30px;
+    height: 30px;
+    margin: 0;
+    border-radius: 7px;
+    border: 2px solid #C7BFA0;
+    background: #fff;
+    position: relative;
+    cursor: pointer;
+    flex-shrink: 0;
+    touch-action: manipulation;
+  }
+  .sb-check::after {
+    content: "";
+    position: absolute;
+    left: 9px;
+    top: 4px;
+    width: 7px;
+    height: 14px;
+    border: solid #fff;
+    border-width: 0 3px 3px 0;
+    transform: rotate(40deg);
+    opacity: 0;
+  }
+  .sb-check:checked::after { opacity: 1; }
+  .sb-check-home:checked { background: var(--marigold); border-color: var(--marigold); }
+  .sb-check-store:checked { background: var(--herb); border-color: var(--herb); }
   .sb-shop-item-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
   .sb-shop-item-text { font-size: 14px; color: var(--ink); }
   .sb-shop-item-have { color: #8a8168; font-style: italic; }
@@ -2871,12 +2960,32 @@ const BASE_STYLES = `
     max-width: 560px;
     max-height: 85vh;
     overflow-y: auto;
+    position: relative;
   }
+  .sb-sheet-close {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(43,58,50,0.06);
+    color: #6b6250;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .sb-sheet-close:hover { background: rgba(43,58,50,0.12); color: var(--chalk); }
   .sb-sheet-title {
     font-family: 'Zilla Slab', serif;
     font-weight: 700;
     font-size: 24px;
     margin: 0 0 18px;
+    padding-right: 36px;
     color: var(--chalk);
   }
   .sb-field {
