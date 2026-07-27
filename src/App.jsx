@@ -221,31 +221,56 @@ async function apiDeleteRecipe(id) {
 }
 
 async function apiListCalendar() {
-  const res = await fetch(`${REST}/calendar_assignments?select=*`, { headers: authHeaders() });
+  const res = await fetch(`${REST}/calendar_assignments?select=*&order=created_at.asc`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Couldn't load calendar (${res.status})`);
   const rows = await res.json();
   const map = {};
   rows.forEach((row) => {
-    map[row.date] = row.recipe_id;
+    if (!map[row.date]) map[row.date] = [];
+    map[row.date].push({ id: row.id, recipeId: row.recipe_id });
   });
   return map;
 }
 
-async function apiAssignDate(dateStr, recipeId) {
-  const res = await fetch(`${REST}/calendar_assignments?on_conflict=date`, {
+// Adds a recipe to a day without disturbing anything else already there.
+async function apiAddAssignment(dateStr, recipeId) {
+  const id = "a" + Date.now() + Math.random().toString(36).slice(2, 7);
+  const res = await fetch(`${REST}/calendar_assignments`, {
     method: "POST",
-    headers: { ...authHeaders(), Prefer: "resolution=merge-duplicates,return=representation" },
-    body: JSON.stringify({ date: dateStr, recipe_id: recipeId }),
+    headers: { ...authHeaders(), Prefer: "return=representation" },
+    body: JSON.stringify({ id, date: dateStr, recipe_id: recipeId }),
   });
   if (!res.ok) throw new Error(`Couldn't assign recipe (${res.status})`);
+  const [row] = await res.json();
+  return { id: row.id, recipeId: row.recipe_id };
 }
 
-async function apiUnassignDate(dateStr) {
-  const res = await fetch(`${REST}/calendar_assignments?date=eq.${dateStr}`, {
+// Moves one specific assignment to a different day (used by drag-and-drop).
+async function apiMoveAssignment(assignmentId, newDateStr) {
+  const res = await fetch(`${REST}/calendar_assignments?id=eq.${encodeURIComponent(assignmentId)}`, {
+    method: "PATCH",
+    headers: authHeaders(),
+    body: JSON.stringify({ date: newDateStr }),
+  });
+  if (!res.ok) throw new Error(`Couldn't move that recipe (${res.status})`);
+}
+
+// Removes one specific assignment (not the whole day).
+async function apiRemoveAssignment(assignmentId) {
+  const res = await fetch(`${REST}/calendar_assignments?id=eq.${encodeURIComponent(assignmentId)}`, {
     method: "DELETE",
     headers: authHeaders(),
   });
-  if (!res.ok) throw new Error(`Couldn't clear that day (${res.status})`);
+  if (!res.ok) throw new Error(`Couldn't remove that day's recipe (${res.status})`);
+}
+
+// Used when a recipe is deleted outright, to clear it off every day it was on.
+async function apiDeleteAssignmentsByRecipe(recipeId) {
+  const res = await fetch(`${REST}/calendar_assignments?recipe_id=eq.${encodeURIComponent(recipeId)}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(`Couldn't clean up the calendar (${res.status})`);
 }
 
 // ---------- shopping list ----------
@@ -1337,9 +1362,13 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onToggleHaveAtHome, on
   const [manualText, setManualText] = useState("");
   const [note, setNote] = useState("");
 
-  const scheduledDays = days
-    .map((d) => ({ d, key: isoDate(d), recipe: calendar[isoDate(d)] ? recipeById(calendar[isoDate(d)]) : null }))
-    .filter((row) => row.recipe);
+  const scheduledDays = days.flatMap((d) => {
+    const dateKey = isoDate(d);
+    const assignments = calendar[dateKey] || [];
+    return assignments
+      .map((a) => ({ d, key: a.id, recipe: recipeById(a.recipeId) }))
+      .filter((row) => row.recipe);
+  });
 
   const toggleDaySelection = (key) => {
     setSelectedDays((prev) => {
@@ -1610,6 +1639,8 @@ export default function SupperBoard() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shoppingOpen, setShoppingOpen] = useState(false);
   const [shoppingItems, setShoppingItems] = useState([]);
+  const [dayCarouselIndex, setDayCarouselIndex] = useState({}); // { [dateKey]: number }
+  const setDayIndex = (key, idx) => setDayCarouselIndex((prev) => ({ ...prev, [key]: idx }));
 
   // ---- try to silently restore a "remembered" session on first load ----
   useEffect(() => {
@@ -1724,18 +1755,19 @@ export default function SupperBoard() {
 
   // Moves/swaps/assigns a recipe onto a day, persisting to Supabase and
   // updating local state. `sourceDate` is null when dragging from the recipe box.
-  const performDrop = async (recipe, sourceDate, dropDateStr) => {
+  const performDrop = async (recipe, sourceDate, assignmentId, dropDateStr) => {
     if (!dropDateStr) return;
 
     if (!sourceDate) {
-      // Dragged straight from the recipe box — just assign (overwrite if occupied).
+      // Dragged straight from the recipe box — add it alongside whatever's already there.
       if (isPreviewSandbox) {
-        setCalendar((prev) => ({ ...prev, [dropDateStr]: recipe.id }));
+        const entry = { id: newShoppingItemId(), recipeId: recipe.id };
+        setCalendar((prev) => ({ ...prev, [dropDateStr]: [...(prev[dropDateStr] || []), entry] }));
         return;
       }
       try {
-        await apiAssignDate(dropDateStr, recipe.id);
-        setCalendar((prev) => ({ ...prev, [dropDateStr]: recipe.id }));
+        const entry = await apiAddAssignment(dropDateStr, recipe.id);
+        setCalendar((prev) => ({ ...prev, [dropDateStr]: [...(prev[dropDateStr] || []), entry] }));
         setActionError("");
       } catch (err) {
         console.error(err);
@@ -1747,26 +1779,21 @@ export default function SupperBoard() {
     const sourceStr = isoDate(sourceDate);
     if (sourceStr === dropDateStr) return; // dropped back on itself
 
-    const destRecipeId = calendarRef.current[dropDateStr] || null;
-
-    // Optimistic local update (this is also the final state in preview mode).
+    // Move just this one assignment from the source day to the destination day.
     setCalendar((prev) => {
       const next = { ...prev };
-      if (destRecipeId) next[sourceStr] = destRecipeId;
+      const fromList = (next[sourceStr] || []).filter((a) => a.id !== assignmentId);
+      const moved = (prev[sourceStr] || []).find((a) => a.id === assignmentId);
+      if (fromList.length > 0) next[sourceStr] = fromList;
       else delete next[sourceStr];
-      next[dropDateStr] = recipe.id;
+      if (moved) next[dropDateStr] = [...(next[dropDateStr] || []), moved];
       return next;
     });
 
     if (isPreviewSandbox) return;
 
     try {
-      if (destRecipeId) {
-        await Promise.all([apiAssignDate(dropDateStr, recipe.id), apiAssignDate(sourceStr, destRecipeId)]);
-      } else {
-        await apiAssignDate(dropDateStr, recipe.id);
-        await apiUnassignDate(sourceStr);
-      }
+      await apiMoveAssignment(assignmentId, dropDateStr);
       setActionError("");
     } catch (err) {
       console.error(err);
@@ -1815,21 +1842,22 @@ export default function SupperBoard() {
     if (ds.armed && ds.moved) {
       suppressNextClick();
       const dropDateStr = hoverDateRef.current;
-      performDrop(ds.recipe, ds.sourceDate, dropDateStr);
+      performDrop(ds.recipe, ds.sourceDate, ds.assignmentId, dropDateStr);
     }
 
     dragRef.current = null;
     endDragVisuals();
   }
 
-  const startDrag = (e, recipe, sourceDate) => {
+  const startDrag = (e, recipe, sourceDate, assignmentId) => {
     if (e.pointerType === "mouse" && e.button !== 0) return;
     const isTouch = e.pointerType !== "mouse";
-    const key = sourceDate ? "day-" + isoDate(sourceDate) : "box-" + recipe.id;
+    const key = sourceDate ? "day-" + isoDate(sourceDate) + "-" + assignmentId : "box-" + recipe.id;
 
     const dragSession = {
       recipe,
       sourceDate,
+      assignmentId,
       key,
       pointerId: e.pointerId,
       pointerType: e.pointerType,
@@ -1917,9 +1945,10 @@ export default function SupperBoard() {
 
   const deleteRecipe = async (id) => {
     const clearFromCalendar = (prev) => {
-      const next = { ...prev };
-      Object.keys(next).forEach((date) => {
-        if (next[date] === id) delete next[date];
+      const next = {};
+      Object.keys(prev).forEach((date) => {
+        const remaining = prev[date].filter((a) => a.recipeId !== id);
+        if (remaining.length > 0) next[date] = remaining;
       });
       return next;
     };
@@ -1932,8 +1961,8 @@ export default function SupperBoard() {
     }
     try {
       await apiDeleteRecipe(id);
+      await apiDeleteAssignmentsByRecipe(id);
       setRecipes((prev) => prev.filter((r) => r.id !== id));
-      // The calendar_assignments table cascades on delete, so clear it locally too.
       setCalendar(clearFromCalendar);
       setEditingRecipe(null);
       setActionError("");
@@ -1958,17 +1987,20 @@ export default function SupperBoard() {
     }
   };
 
+  // Adds a recipe to a day alongside whatever's already scheduled there —
+  // days can now hold more than one dinner.
   const assignToDate = async (date, recipe) => {
     const key = isoDate(date);
     if (isPreviewSandbox) {
-      setCalendar((prev) => ({ ...prev, [key]: recipe.id }));
+      const entry = { id: newShoppingItemId(), recipeId: recipe.id };
+      setCalendar((prev) => ({ ...prev, [key]: [...(prev[key] || []), entry] }));
       setAssignDate(null);
       setQuizForDate(null);
       return;
     }
     try {
-      await apiAssignDate(key, recipe.id);
-      setCalendar((prev) => ({ ...prev, [key]: recipe.id }));
+      const entry = await apiAddAssignment(key, recipe.id);
+      setCalendar((prev) => ({ ...prev, [key]: [...(prev[key] || []), entry] }));
       setAssignDate(null);
       setQuizForDate(null);
       setActionError("");
@@ -1978,23 +2010,22 @@ export default function SupperBoard() {
     }
   };
 
-  const unassignDate = async (date) => {
+  // Removes one specific recipe from one specific day (not the whole day).
+  const removeAssignment = async (date, assignmentId) => {
     const key = isoDate(date);
+    const applyLocal = (prev) => {
+      const next = { ...prev };
+      next[key] = (next[key] || []).filter((a) => a.id !== assignmentId);
+      if (next[key].length === 0) delete next[key];
+      return next;
+    };
     if (isPreviewSandbox) {
-      setCalendar((prev) => {
-        const next = { ...prev };
-        delete next[key];
-        return next;
-      });
+      setCalendar(applyLocal);
       return;
     }
     try {
-      await apiUnassignDate(key);
-      setCalendar((prev) => {
-        const next = { ...prev };
-        delete next[key];
-        return next;
-      });
+      await apiRemoveAssignment(assignmentId);
+      setCalendar(applyLocal);
       setActionError("");
     } catch (err) {
       console.error(err);
@@ -2208,10 +2239,14 @@ export default function SupperBoard() {
         <div className="sb-calendar-grid">
           {days.map((d) => {
             const key = isoDate(d);
-            const recipeId = calendar[key];
-            const recipe = recipeId ? recipeById(recipeId) : null;
+            const assignments = calendar[key] || [];
+            const rawIdx = dayCarouselIndex[key] || 0;
+            const idx = assignments.length ? Math.min(rawIdx, assignments.length - 1) : 0;
+            const current = assignments[idx];
+            const recipe = current ? recipeById(current.recipeId) : null;
             const isToday = key === isoDate(new Date());
-            const isHovered = hoverDate === key && dragActiveKey !== "day-" + key;
+            const draggingFromThisDay = dragActiveKey && dragActiveKey.startsWith("day-" + key + "-");
+            const isHovered = hoverDate === key && !draggingFromThisDay;
             return (
               <div
                 key={key}
@@ -2223,14 +2258,50 @@ export default function SupperBoard() {
                   <span className="sb-day-date">{fmtDate(d)}</span>
                 </div>
                 {recipe ? (
-                  <RecipeCard
-                    recipe={recipe}
-                    pinned
-                    onOpen={() => setEditingRecipe(recipe)}
-                    onRemove={() => unassignDate(d)}
-                    onDragStart={(e, r) => startDrag(e, r, d)}
-                    dragging={dragActiveKey === "day-" + key}
-                  />
+                  <div className="sb-day-card-stack">
+                    <RecipeCard
+                      recipe={recipe}
+                      pinned
+                      onOpen={() => setEditingRecipe(recipe)}
+                      onRemove={() => removeAssignment(d, current.id)}
+                      onDragStart={(e, r) => startDrag(e, r, d, current.id)}
+                      dragging={dragActiveKey === "day-" + key + "-" + current.id}
+                    />
+                    {assignments.length > 1 && (
+                      <div className="sb-day-carousel">
+                        <button
+                          type="button"
+                          className="sb-day-carousel-arrow"
+                          onClick={() => setDayIndex(key, (idx - 1 + assignments.length) % assignments.length)}
+                          aria-label="Previous recipe"
+                        >
+                          ‹
+                        </button>
+                        <div className="sb-day-carousel-dots">
+                          {assignments.map((a, i) => (
+                            <button
+                              key={a.id}
+                              type="button"
+                              className={"sb-day-carousel-dot" + (i === idx ? " sb-day-carousel-dot-active" : "")}
+                              onClick={() => setDayIndex(key, i)}
+                              aria-label={`Show recipe ${i + 1} of ${assignments.length}`}
+                            />
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          className="sb-day-carousel-arrow"
+                          onClick={() => setDayIndex(key, (idx + 1) % assignments.length)}
+                          aria-label="Next recipe"
+                        >
+                          ›
+                        </button>
+                      </div>
+                    )}
+                    <button type="button" className="sb-day-add-more" onClick={() => setAssignDate(d)}>
+                      + add another
+                    </button>
+                  </div>
                 ) : (
                   <EmptySlot onClick={() => setAssignDate(d)} hovered={isHovered} />
                 )}
@@ -2891,6 +2962,57 @@ const BASE_STYLES = `
     padding: 0;
   }
 
+  .sb-day-card-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+  }
+  .sb-day-carousel {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+  }
+  .sb-day-carousel-arrow {
+    background: none;
+    border: none;
+    color: #3a2a16;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+    touch-action: manipulation;
+  }
+  .sb-day-carousel-arrow:hover { color: var(--tomato); }
+  .sb-day-carousel-dots { display: flex; gap: 5px; }
+  .sb-day-carousel-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(58,42,22,0.3);
+    padding: 0;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .sb-day-carousel-dot-active { background: var(--tomato); }
+  .sb-day-add-more {
+    background: none;
+    border: none;
+    color: #3a2a16;
+    opacity: 0.75;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    cursor: pointer;
+    padding: 2px 4px;
+    touch-action: manipulation;
+  }
+  .sb-day-add-more:hover { opacity: 1; color: var(--herb); }
+
   .sb-box-section { padding: 26px 28px 32px; }
   .sb-section-title {
     font-family: 'Zilla Slab', serif;
@@ -3201,6 +3323,7 @@ const BASE_STYLES = `
       gap: 8px;
     }
     .sb-card { width: 100%; }
+    .sb-day-card-stack { flex: 1; min-width: 0; }
     .sb-card-pinned {
       flex: 1;
       min-height: 0;
@@ -3243,3 +3366,4 @@ const BASE_STYLES = `
     .sb-star { font-size: 19px; padding: 2px; }
   }
 `;
+
