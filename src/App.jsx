@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 
 /*
   DINNER PLANNER — a two-week family dinner planner.
@@ -19,11 +19,69 @@ import { useState, useEffect, useMemo } from "react";
 const SUPABASE_URL = "https://cyxnxoeerlxanjltxhdp.supabase.co";
 const SUPABASE_KEY = "sb_publishable_4jQAFzZO52uLigenwuJ9Ng_iVxVgXHm";
 const REST = `${SUPABASE_URL}/rest/v1`;
-const SB_HEADERS = {
-  apikey: SUPABASE_KEY,
-  Authorization: `Bearer ${SUPABASE_KEY}`,
-  "Content-Type": "application/json",
-};
+const AUTH = `${SUPABASE_URL}/auth/v1`;
+
+// Kept outside React state so every fetch helper below can read the latest
+// token without needing it threaded through as an argument. Updated by
+// the login/logout handlers in the main app component.
+let currentAccessToken = null;
+
+function authHeaders() {
+  return {
+    apikey: SUPABASE_KEY,
+    Authorization: `Bearer ${currentAccessToken || SUPABASE_KEY}`,
+    "Content-Type": "application/json",
+  };
+}
+
+// ---------- auth ----------
+
+async function apiLogin(email, password) {
+  const res = await fetch(`${AUTH}/token?grant_type=password`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error_description || data.msg || "Couldn't sign in — check the email and password.");
+  }
+  return data; // { access_token, refresh_token, user, ... }
+}
+
+async function apiLogout(accessToken) {
+  try {
+    await fetch(`${AUTH}/logout`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${accessToken}` },
+    });
+  } catch {
+    /* best-effort — clearing local state below is what actually matters */
+  }
+}
+
+// ---------- user management (routed through /api/manage-users so the
+// Supabase service-role key never has to live in the browser) ----------
+
+async function callManageUsers(action, payload = {}) {
+  const res = await fetch("/api/manage-users", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${currentAccessToken || ""}`,
+    },
+    body: JSON.stringify({ action, ...payload }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+const apiListUsers = () => callManageUsers("list").then((d) => d.users);
+const apiCreateUser = (email, password) => callManageUsers("create", { email, password });
+const apiUpdateUserEmail = (id, email) => callManageUsers("updateEmail", { id, email });
+const apiUpdateUserPassword = (id, password) => callManageUsers("updatePassword", { id, password });
+const apiDeleteUser = (id) => callManageUsers("delete", { id });
 
 function toDbRecipe(r) {
   return {
@@ -56,7 +114,7 @@ function fromDbRecipe(row) {
 }
 
 async function apiListRecipes() {
-  const res = await fetch(`${REST}/recipes?select=*`, { headers: SB_HEADERS });
+  const res = await fetch(`${REST}/recipes?select=*`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Couldn't load recipes (${res.status})`);
   const rows = await res.json();
   return rows.map(fromDbRecipe);
@@ -65,7 +123,7 @@ async function apiListRecipes() {
 async function apiSeedRecipes(recipeList) {
   const res = await fetch(`${REST}/recipes`, {
     method: "POST",
-    headers: { ...SB_HEADERS, Prefer: "return=representation" },
+    headers: { ...authHeaders(), Prefer: "return=representation" },
     body: JSON.stringify(recipeList.map(toDbRecipe)),
   });
   if (!res.ok) throw new Error(`Couldn't seed starter recipes (${res.status})`);
@@ -76,7 +134,7 @@ async function apiSeedRecipes(recipeList) {
 async function apiInsertRecipe(recipe) {
   const res = await fetch(`${REST}/recipes`, {
     method: "POST",
-    headers: { ...SB_HEADERS, Prefer: "return=representation" },
+    headers: { ...authHeaders(), Prefer: "return=representation" },
     body: JSON.stringify(toDbRecipe(recipe)),
   });
   if (!res.ok) throw new Error(`Couldn't add recipe (${res.status})`);
@@ -87,7 +145,7 @@ async function apiInsertRecipe(recipe) {
 async function apiUpdateRecipe(recipe) {
   const res = await fetch(`${REST}/recipes?id=eq.${encodeURIComponent(recipe.id)}`, {
     method: "PATCH",
-    headers: { ...SB_HEADERS, Prefer: "return=representation" },
+    headers: { ...authHeaders(), Prefer: "return=representation" },
     body: JSON.stringify(toDbRecipe(recipe)),
   });
   if (!res.ok) throw new Error(`Couldn't save recipe (${res.status})`);
@@ -98,7 +156,7 @@ async function apiUpdateRecipe(recipe) {
 async function apiUpdateRating(id, rating) {
   const res = await fetch(`${REST}/recipes?id=eq.${encodeURIComponent(id)}`, {
     method: "PATCH",
-    headers: { ...SB_HEADERS, Prefer: "return=representation" },
+    headers: { ...authHeaders(), Prefer: "return=representation" },
     body: JSON.stringify({ rating }),
   });
   if (!res.ok) throw new Error(`Couldn't save rating (${res.status})`);
@@ -109,13 +167,13 @@ async function apiUpdateRating(id, rating) {
 async function apiDeleteRecipe(id) {
   const res = await fetch(`${REST}/recipes?id=eq.${encodeURIComponent(id)}`, {
     method: "DELETE",
-    headers: SB_HEADERS,
+    headers: authHeaders(),
   });
   if (!res.ok) throw new Error(`Couldn't delete recipe (${res.status})`);
 }
 
 async function apiListCalendar() {
-  const res = await fetch(`${REST}/calendar_assignments?select=*`, { headers: SB_HEADERS });
+  const res = await fetch(`${REST}/calendar_assignments?select=*`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Couldn't load calendar (${res.status})`);
   const rows = await res.json();
   const map = {};
@@ -128,7 +186,7 @@ async function apiListCalendar() {
 async function apiAssignDate(dateStr, recipeId) {
   const res = await fetch(`${REST}/calendar_assignments?on_conflict=date`, {
     method: "POST",
-    headers: { ...SB_HEADERS, Prefer: "resolution=merge-duplicates,return=representation" },
+    headers: { ...authHeaders(), Prefer: "resolution=merge-duplicates,return=representation" },
     body: JSON.stringify({ date: dateStr, recipe_id: recipeId }),
   });
   if (!res.ok) throw new Error(`Couldn't assign recipe (${res.status})`);
@@ -137,7 +195,7 @@ async function apiAssignDate(dateStr, recipeId) {
 async function apiUnassignDate(dateStr) {
   const res = await fetch(`${REST}/calendar_assignments?date=eq.${dateStr}`, {
     method: "DELETE",
-    headers: SB_HEADERS,
+    headers: authHeaders(),
   });
   if (!res.ok) throw new Error(`Couldn't clear that day (${res.status})`);
 }
@@ -303,9 +361,22 @@ function Chip({ label, active, onClick }) {
 }
 
 // A recipe index card. `pinned` renders the calendar version (rotated, with a tack).
-function RecipeCard({ recipe, pinned, onOpen, onRemove }) {
+// `onDragStart(e, recipe)` wires up press-and-hold dragging; `dragging` dims this
+// exact instance while it's the one being picked up.
+function RecipeCard({ recipe, pinned, onOpen, onRemove, onDragStart, dragging }) {
   return (
-    <div className={"sb-card" + (pinned ? " sb-card-pinned" : "")} onClick={() => onOpen(recipe)}>
+    <div
+      className={"sb-card" + (pinned ? " sb-card-pinned" : "") + (dragging ? " sb-card-dragging" : "")}
+      onClick={() => onOpen(recipe)}
+      onPointerDown={
+        onDragStart
+          ? (e) => {
+              if (e.target.closest(".sb-card-remove, .sb-star")) return;
+              onDragStart(e, recipe);
+            }
+          : undefined
+      }
+    >
       {pinned && <div className="sb-tack" />}
       <div className="sb-card-holes">
         <span />
@@ -344,9 +415,9 @@ function RecipeCard({ recipe, pinned, onOpen, onRemove }) {
   );
 }
 
-function EmptySlot({ date, onClick }) {
+function EmptySlot({ onClick, hovered }) {
   return (
-    <div className="sb-slot-empty" onClick={onClick}>
+    <div className={"sb-slot-empty" + (hovered ? " sb-slot-empty-hover" : "")} onClick={onClick}>
       <div className="sb-slot-plus">+</div>
       <div className="sb-slot-label">add dinner</div>
     </div>
@@ -680,9 +751,293 @@ function AssignPanel({ date, recipes, onAssign, onClose, onOpenQuiz }) {
   );
 }
 
+// ---------- login gate ----------
+
+function LoginScreen({ onLogin, error, loading }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!email.trim() || !password) return;
+    onLogin(email.trim(), password);
+  };
+
+  return (
+    <div className="sb-app sb-login-app">
+      <style>{BASE_STYLES}</style>
+      <div className="sb-login-screen">
+        <div className="sb-login-card">
+          <div className="sb-eyebrow">family menu, locked</div>
+          <h1 className="sb-title sb-login-title">Dinner Planner</h1>
+          <p className="sb-login-sub">Sign in with the account made for you.</p>
+
+          <form onSubmit={submit}>
+            <label className="sb-field sb-field-wide">
+              <span>Email</span>
+              <input
+                type="email"
+                autoComplete="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="you@family.com"
+              />
+            </label>
+            <label className="sb-field sb-field-wide">
+              <span>Password</span>
+              <input
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+              />
+            </label>
+
+            {error && <p className="sb-login-error">{error}</p>}
+
+            <button className="sb-btn-solid sb-login-submit" type="submit" disabled={loading}>
+              {loading ? "signing in..." : "sign in"}
+            </button>
+          </form>
+
+          <p className="sb-login-note">
+            Don't have an account yet? Ask whoever set up this app to create one for you.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- settings / user management ----------
+
+function SettingsPanel({ onClose }) {
+  const [users, setUsers] = useState(null); // null while loading
+  const [loadErr, setLoadErr] = useState("");
+  const [busyId, setBusyId] = useState(null); // user id currently being edited/saved
+  const [actionErr, setActionErr] = useState("");
+
+  const [newEmail, setNewEmail] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  const [editingEmailId, setEditingEmailId] = useState(null);
+  const [emailDraft, setEmailDraft] = useState("");
+  const [editingPasswordId, setEditingPasswordId] = useState(null);
+  const [passwordDraft, setPasswordDraft] = useState("");
+
+  const loadUsers = () => {
+    setLoadErr("");
+    apiListUsers()
+      .then(setUsers)
+      .catch((err) => setLoadErr(err.message));
+  };
+
+  useEffect(() => {
+    loadUsers();
+  }, []);
+
+  const handleCreate = async (e) => {
+    e.preventDefault();
+    if (!newEmail.trim() || !newPassword) return;
+    setCreating(true);
+    setActionErr("");
+    try {
+      await apiCreateUser(newEmail.trim(), newPassword);
+      setNewEmail("");
+      setNewPassword("");
+      loadUsers();
+    } catch (err) {
+      setActionErr(err.message);
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const saveEmail = async (id) => {
+    if (!emailDraft.trim()) return;
+    setBusyId(id);
+    setActionErr("");
+    try {
+      await apiUpdateUserEmail(id, emailDraft.trim());
+      setEditingEmailId(null);
+      loadUsers();
+    } catch (err) {
+      setActionErr(err.message);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const savePassword = async (id) => {
+    if (!passwordDraft || passwordDraft.length < 6) {
+      setActionErr("New password needs to be at least 6 characters.");
+      return;
+    }
+    setBusyId(id);
+    setActionErr("");
+    try {
+      await apiUpdateUserPassword(id, passwordDraft);
+      setEditingPasswordId(null);
+      setPasswordDraft("");
+    } catch (err) {
+      setActionErr(err.message);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const removeUser = async (id, email) => {
+    if (!window.confirm(`Remove ${email}'s account? They won't be able to sign in anymore.`)) return;
+    setBusyId(id);
+    setActionErr("");
+    try {
+      await apiDeleteUser(id);
+      loadUsers();
+    } catch (err) {
+      setActionErr(err.message);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div className="sb-modal-backdrop" onClick={onClose}>
+      <div className="sb-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="sb-eyebrow">family accounts</div>
+        <h2 className="sb-sheet-title">Settings</h2>
+
+        <form onSubmit={handleCreate} className="sb-settings-add">
+          <div className="sb-quiz-question" style={{ marginBottom: 10 }}>
+            Add a new family member
+          </div>
+          <div className="sb-form-grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
+            <label className="sb-field">
+              <span>Email</span>
+              <input type="email" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder="name@family.com" />
+            </label>
+            <label className="sb-field">
+              <span>Password</span>
+              <input
+                type="password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="at least 6 characters"
+              />
+            </label>
+          </div>
+          <button className="sb-btn-solid sb-btn-small" type="submit" disabled={creating}>
+            {creating ? "adding..." : "+ add family member"}
+          </button>
+        </form>
+
+        {actionErr && <p className="sb-login-error">{actionErr}</p>}
+
+        <div className="sb-quiz-question" style={{ margin: "20px 0 10px" }}>
+          Existing accounts
+        </div>
+
+        {loadErr && <p className="sb-login-error">{loadErr}</p>}
+        {!users && !loadErr && <p className="sb-empty-note">Loading accounts...</p>}
+        {users && users.length === 0 && <p className="sb-empty-note">No accounts yet.</p>}
+
+        {users && users.length > 0 && (
+          <div className="sb-settings-users">
+            {users.map((u) => (
+              <div key={u.id} className="sb-settings-user-row">
+                {editingEmailId === u.id ? (
+                  <div className="sb-settings-inline-edit">
+                    <input
+                      type="email"
+                      value={emailDraft}
+                      onChange={(e) => setEmailDraft(e.target.value)}
+                      autoFocus
+                    />
+                    <button className="sb-btn-solid sb-btn-small" onClick={() => saveEmail(u.id)} disabled={busyId === u.id}>
+                      save
+                    </button>
+                    <button className="sb-btn-ghost sb-btn-small" onClick={() => setEditingEmailId(null)}>
+                      cancel
+                    </button>
+                  </div>
+                ) : editingPasswordId === u.id ? (
+                  <div className="sb-settings-inline-edit">
+                    <input
+                      type="password"
+                      value={passwordDraft}
+                      onChange={(e) => setPasswordDraft(e.target.value)}
+                      placeholder="new password"
+                      autoFocus
+                    />
+                    <button className="sb-btn-solid sb-btn-small" onClick={() => savePassword(u.id)} disabled={busyId === u.id}>
+                      save
+                    </button>
+                    <button
+                      className="sb-btn-ghost sb-btn-small"
+                      onClick={() => {
+                        setEditingPasswordId(null);
+                        setPasswordDraft("");
+                      }}
+                    >
+                      cancel
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="sb-settings-user-email">{u.email}</div>
+                    <div className="sb-settings-user-actions">
+                      <button
+                        className="sb-btn-ghost sb-btn-small"
+                        onClick={() => {
+                          setEditingEmailId(u.id);
+                          setEmailDraft(u.email);
+                        }}
+                      >
+                        edit email
+                      </button>
+                      <button
+                        className="sb-btn-ghost sb-btn-small"
+                        onClick={() => {
+                          setEditingPasswordId(u.id);
+                          setPasswordDraft("");
+                        }}
+                      >
+                        reset password
+                      </button>
+                      <button
+                        className="sb-btn-ghost sb-btn-small sb-btn-danger"
+                        onClick={() => removeUser(u.id, u.email)}
+                        disabled={busyId === u.id}
+                      >
+                        remove
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="sb-sheet-actions">
+          <div />
+          <button className="sb-btn-ghost" onClick={onClose}>
+            close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---------- main app ----------
 
 export default function SupperBoard() {
+  const [session, setSession] = useState(null); // { access_token, user } | null
+  const [authError, setAuthError] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+
   const [recipes, setRecipes] = useState([]);
   const [calendar, setCalendar] = useState({});
   const [loading, setLoading] = useState(true);
@@ -699,11 +1054,221 @@ export default function SupperBoard() {
   const [assignDate, setAssignDate] = useState(null); // Date | null
   const [quizOpen, setQuizOpen] = useState(false); // bool, standalone quiz from header
   const [quizForDate, setQuizForDate] = useState(null); // Date | null, quiz launched from a slot
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const handleLogin = async (email, password) => {
+    setAuthLoading(true);
+    setAuthError("");
+    try {
+      const data = await apiLogin(email, password);
+      currentAccessToken = data.access_token;
+      setSession(data);
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    if (session) await apiLogout(session.access_token);
+    currentAccessToken = null;
+    setSession(null);
+    // Reset app state so the next login starts from a clean load.
+    setRecipes([]);
+    setCalendar({});
+    setLoading(true);
+  };
+
+  // ---- drag & drop (mouse drags immediately, touch arms after a short hold) ----
+  const [dragActiveKey, setDragActiveKey] = useState(null); // which card instance is being dragged
+  const [dragRecipeName, setDragRecipeName] = useState("");
+  const [hoverDate, setHoverDate] = useState(null); // iso date string of the day currently under the pointer
+
+  const dragRef = useRef(null); // mutable pointer-tracking state for the active drag gesture
+  const hoverDateRef = useRef(null);
+  const calendarRef = useRef({});
+  const ghostElRef = useRef(null);
+  useEffect(() => {
+    calendarRef.current = calendar;
+  }, [calendar]);
+
+  const TOUCH_HOLD_MS = 220;
+  const MOVE_THRESHOLD = 7;
+
+  const positionGhost = (x, y) => {
+    if (ghostElRef.current) {
+      ghostElRef.current.style.left = x + "px";
+      ghostElRef.current.style.top = y + "px";
+    }
+  };
+
+  const updateHoverTarget = (x, y) => {
+    const el = document.elementFromPoint(x, y);
+    const dayEl = el && el.closest("[data-drop-date]");
+    const nextDate = dayEl ? dayEl.getAttribute("data-drop-date") : null;
+    if (nextDate !== hoverDateRef.current) {
+      hoverDateRef.current = nextDate;
+      setHoverDate(nextDate);
+    }
+  };
+
+  const cleanupDragListeners = () => {
+    document.removeEventListener("pointermove", onDocPointerMove);
+    document.removeEventListener("pointerup", onDocPointerUp);
+    document.removeEventListener("pointercancel", onDocPointerUp);
+  };
+
+  const endDragVisuals = () => {
+    setDragActiveKey(null);
+    setDragRecipeName("");
+    setHoverDate(null);
+    hoverDateRef.current = null;
+    if (ghostElRef.current) ghostElRef.current.style.display = "none";
+  };
+
+  const suppressNextClick = () => {
+    const swallow = (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+    };
+    document.addEventListener("click", swallow, { capture: true, once: true });
+  };
+
+  // Moves/swaps/assigns a recipe onto a day, persisting to Supabase and
+  // updating local state. `sourceDate` is null when dragging from the recipe box.
+  const performDrop = async (recipe, sourceDate, dropDateStr) => {
+    if (!dropDateStr) return;
+
+    if (!sourceDate) {
+      // Dragged straight from the recipe box — just assign (overwrite if occupied).
+      try {
+        await apiAssignDate(dropDateStr, recipe.id);
+        setCalendar((prev) => ({ ...prev, [dropDateStr]: recipe.id }));
+        setActionError("");
+      } catch (err) {
+        console.error(err);
+        setActionError(err.message);
+      }
+      return;
+    }
+
+    const sourceStr = isoDate(sourceDate);
+    if (sourceStr === dropDateStr) return; // dropped back on itself
+
+    const destRecipeId = calendarRef.current[dropDateStr] || null;
+
+    // Optimistic local update.
+    setCalendar((prev) => {
+      const next = { ...prev };
+      if (destRecipeId) next[sourceStr] = destRecipeId;
+      else delete next[sourceStr];
+      next[dropDateStr] = recipe.id;
+      return next;
+    });
+
+    try {
+      if (destRecipeId) {
+        await Promise.all([apiAssignDate(dropDateStr, recipe.id), apiAssignDate(sourceStr, destRecipeId)]);
+      } else {
+        await apiAssignDate(dropDateStr, recipe.id);
+        await apiUnassignDate(sourceStr);
+      }
+      setActionError("");
+    } catch (err) {
+      console.error(err);
+      setActionError(err.message);
+      // Fall back to the server's version of the calendar so we don't drift.
+      try {
+        const fresh = await apiListCalendar();
+        setCalendar(fresh);
+      } catch {
+        /* ignore secondary failure */
+      }
+    }
+  };
+
+  function onDocPointerMove(e) {
+    const ds = dragRef.current;
+    if (!ds || e.pointerId !== ds.pointerId) return;
+    const dx = e.clientX - ds.startX;
+    const dy = e.clientY - ds.startY;
+    const dist = Math.hypot(dx, dy);
+
+    if (!ds.armed) {
+      if (ds.pointerType === "mouse" && dist > MOVE_THRESHOLD) {
+        ds.armed = true;
+        setDragActiveKey(ds.key);
+        setDragRecipeName(ds.recipe.name);
+        if (ghostElRef.current) ghostElRef.current.style.display = "block";
+      }
+      return; // touch just waits for the hold timer
+    }
+
+    ds.moved = true;
+    e.preventDefault();
+    positionGhost(e.clientX, e.clientY);
+    updateHoverTarget(e.clientX, e.clientY);
+  }
+
+  function onDocPointerUp(e) {
+    const ds = dragRef.current;
+    if (!ds || e.pointerId !== ds.pointerId) return;
+    if (ds.holdTimer) clearTimeout(ds.holdTimer);
+    cleanupDragListeners();
+
+    if (ds.armed && ds.moved) {
+      suppressNextClick();
+      const dropDateStr = hoverDateRef.current;
+      performDrop(ds.recipe, ds.sourceDate, dropDateStr);
+    }
+
+    dragRef.current = null;
+    endDragVisuals();
+  }
+
+  const startDrag = (e, recipe, sourceDate) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    const isTouch = e.pointerType !== "mouse";
+    const key = sourceDate ? "day-" + isoDate(sourceDate) : "box-" + recipe.id;
+
+    const dragSession = {
+      recipe,
+      sourceDate,
+      key,
+      pointerId: e.pointerId,
+      pointerType: e.pointerType,
+      startX: e.clientX,
+      startY: e.clientY,
+      armed: false,
+      moved: false,
+      holdTimer: null,
+    };
+    dragRef.current = dragSession;
+
+    document.addEventListener("pointermove", onDocPointerMove);
+    document.addEventListener("pointerup", onDocPointerUp);
+    document.addEventListener("pointercancel", onDocPointerUp);
+
+    if (isTouch) {
+      dragSession.holdTimer = window.setTimeout(() => {
+        if (dragRef.current !== dragSession) return; // gesture already ended/replaced
+        dragSession.armed = true;
+        setDragActiveKey(key);
+        setDragRecipeName(recipe.name);
+        if (ghostElRef.current) {
+          ghostElRef.current.style.display = "block";
+          positionGhost(dragSession.startX, dragSession.startY);
+        }
+      }, TOUCH_HOLD_MS);
+    }
+  };
 
   const days = useMemo(() => nextTwoWeeks(), []);
 
-  // ---- load from Supabase on mount ----
+  // ---- load from Supabase once signed in ----
   useEffect(() => {
+    if (!session) return;
     (async () => {
       try {
         let recipesValue = await apiListRecipes();
@@ -721,7 +1286,7 @@ export default function SupperBoard() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [session]);
 
   const saveRecipe = async (recipe) => {
     try {
@@ -824,6 +1389,10 @@ export default function SupperBoard() {
 
   const boxFiltersActive = boxSearch.trim() || boxCuisine || boxProtein || boxTag || boxSort !== "name";
 
+  if (!session) {
+    return <LoginScreen onLogin={handleLogin} error={authError} loading={authLoading} />;
+  }
+
   if (loading) {
     return (
       <div className="sb-app">
@@ -849,8 +1418,16 @@ export default function SupperBoard() {
           <button className="sb-btn-solid" onClick={() => setEditingRecipe("new")}>
             + add recipe
           </button>
+          <button className="sb-btn-icon" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
+            ⚙
+          </button>
+          <button className="sb-btn-ghost-light" onClick={handleLogout}>
+            log out
+          </button>
         </div>
       </div>
+
+      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
 
       {loadError && (
         <p className="sb-empty-note" style={{ padding: "12px 28px 0", color: "#C1442E" }}>
@@ -871,21 +1448,38 @@ export default function SupperBoard() {
             const recipeId = calendar[key];
             const recipe = recipeId ? recipeById(recipeId) : null;
             const isToday = key === isoDate(new Date());
+            const isHovered = hoverDate === key && dragActiveKey !== "day-" + key;
             return (
-              <div key={key} className="sb-day-col">
+              <div
+                key={key}
+                className={"sb-day-col" + (isHovered ? " sb-day-col-hover" : "")}
+                data-drop-date={key}
+              >
                 <div className={"sb-day-label" + (isToday ? " sb-day-label-today" : "")}>
                   <span className="sb-day-name">{fmtDay(d)}</span>
                   <span className="sb-day-date">{fmtDate(d)}</span>
                 </div>
                 {recipe ? (
-                  <RecipeCard recipe={recipe} pinned onOpen={() => setEditingRecipe(recipe)} onRemove={() => unassignDate(d)} />
+                  <RecipeCard
+                    recipe={recipe}
+                    pinned
+                    onOpen={() => setEditingRecipe(recipe)}
+                    onRemove={() => unassignDate(d)}
+                    onDragStart={(e, r) => startDrag(e, r, d)}
+                    dragging={dragActiveKey === "day-" + key}
+                  />
                 ) : (
-                  <EmptySlot date={d} onClick={() => setAssignDate(d)} />
+                  <EmptySlot onClick={() => setAssignDate(d)} hovered={isHovered} />
                 )}
               </div>
             );
           })}
         </div>
+      </div>
+
+      <div className="sb-drag-ghost" ref={ghostElRef} style={{ display: "none" }}>
+        <div className="sb-drag-ghost-label">moving</div>
+        <div className="sb-drag-ghost-title">{dragRecipeName}</div>
       </div>
 
       <div className="sb-box-section">
@@ -949,7 +1543,13 @@ export default function SupperBoard() {
             ) : (
               <div className="sb-box-grid">
                 {visibleRecipes.map((r) => (
-                  <RecipeCard key={r.id} recipe={r} onOpen={() => setEditingRecipe(r)} />
+                  <RecipeCard
+                    key={r.id}
+                    recipe={r}
+                    onOpen={() => setEditingRecipe(r)}
+                    onDragStart={(e, recipe) => startDrag(e, recipe, null)}
+                    dragging={dragActiveKey === "box-" + r.id}
+                  />
                 ))}
               </div>
             )}
@@ -1030,6 +1630,35 @@ const BASE_STYLES = `
     color: var(--chalk);
   }
 
+  .sb-login-screen {
+    background: var(--chalk);
+    min-height: 600px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 20px;
+  }
+  .sb-login-card {
+    background: #FBF6E4;
+    border-radius: 10px;
+    padding: 32px 30px;
+    width: 100%;
+    max-width: 380px;
+  }
+  .sb-login-title { color: var(--chalk); font-size: 28px; margin-bottom: 6px; }
+  .sb-login-sub { font-size: 13px; color: #6b6250; margin: 0 0 22px; }
+  .sb-login-error {
+    background: #FBEAE6;
+    border: 1px solid #E2B3A7;
+    color: var(--tomato);
+    font-size: 13px;
+    padding: 9px 12px;
+    border-radius: 5px;
+    margin: -4px 0 16px;
+  }
+  .sb-login-submit { width: 100%; margin-top: 4px; }
+  .sb-login-note { font-size: 12px; color: #8a8168; margin: 18px 0 0; text-align: center; }
+
   .sb-header {
     background: var(--chalk);
     color: #F5EAC8;
@@ -1057,7 +1686,58 @@ const BASE_STYLES = `
     margin: 0;
     color: #F8F2DD;
   }
-  .sb-header-actions { display: flex; gap: 10px; }
+  .sb-header-actions { display: flex; gap: 10px; align-items: center; }
+  .sb-btn-icon {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.25);
+    color: #F5EAC8;
+    width: 40px;
+    height: 40px;
+    border-radius: 5px;
+    font-size: 17px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .sb-btn-icon:hover { background: rgba(255,255,255,0.16); }
+
+  .sb-settings-add {
+    border: 1px solid #E4D6AC;
+    border-radius: 6px;
+    padding: 16px;
+    margin-bottom: 6px;
+  }
+  .sb-settings-users {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .sb-settings-user-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: #fff;
+    border: 1px solid #E4D6AC;
+    border-radius: 6px;
+    flex-wrap: wrap;
+  }
+  .sb-settings-user-email { font-size: 13px; font-weight: 600; color: var(--ink); }
+  .sb-settings-user-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .sb-settings-inline-edit { display: flex; gap: 8px; align-items: center; flex: 1; flex-wrap: wrap; }
+  .sb-settings-inline-edit input {
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    padding: 7px 9px;
+    border: 1px solid #D6C89A;
+    border-radius: 4px;
+    flex: 1;
+    min-width: 160px;
+  }
 
   .sb-btn-solid, .sb-btn-ghost, .sb-btn-ghost-light {
     font-family: 'Inter', sans-serif;
@@ -1088,6 +1768,11 @@ const BASE_STYLES = `
     gap: 14px;
   }
   .sb-day-col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .sb-day-col-hover {
+    outline: 2px solid var(--herb);
+    outline-offset: 4px;
+    border-radius: 8px;
+  }
   .sb-day-label {
     display: flex;
     flex-direction: column;
@@ -1121,6 +1806,11 @@ const BASE_STYLES = `
     background: rgba(255,255,255,0.08);
   }
   .sb-slot-empty:hover { background: rgba(255,255,255,0.18); }
+  .sb-slot-empty-hover {
+    background: rgba(79,122,91,0.25) !important;
+    border-color: var(--herb) !important;
+    color: var(--herb) !important;
+  }
   .sb-slot-plus { font-size: 22px; font-weight: 700; line-height: 1; }
   .sb-slot-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; }
 
@@ -1130,9 +1820,46 @@ const BASE_STYLES = `
     border-radius: 4px;
     padding: 14px 14px 14px 26px;
     position: relative;
-    cursor: pointer;
+    cursor: grab;
     width: 100%;
     box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+    touch-action: none;
+    user-select: none;
+  }
+  .sb-card-dragging {
+    opacity: 0.35;
+  }
+
+  .sb-drag-ghost {
+    position: fixed;
+    top: 0;
+    left: 0;
+    transform: translate(-50%, -130%);
+    pointer-events: none;
+    z-index: 200;
+    background: var(--card);
+    border: 2px solid var(--herb);
+    border-radius: 6px;
+    padding: 8px 14px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.25);
+    max-width: 220px;
+  }
+  .sb-drag-ghost-label {
+    font-family: 'Inter', sans-serif;
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--herb);
+  }
+  .sb-drag-ghost-title {
+    font-family: 'Zilla Slab', serif;
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--ink);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .sb-card-pinned {
     transform: rotate(-1.5deg);
@@ -1391,7 +2118,7 @@ const BASE_STYLES = `
 
   /* ---------- Mobile (iPhone-width) overrides ---------- */
   * { -webkit-tap-highlight-color: transparent; }
-  .sb-card, .sb-slot-empty, .sb-chip, .sb-btn-solid, .sb-btn-ghost, .sb-btn-ghost-light, .sb-star, .sb-quiz-result {
+  .sb-card, .sb-slot-empty, .sb-chip, .sb-btn-solid, .sb-btn-ghost, .sb-btn-ghost-light, .sb-btn-icon, .sb-star, .sb-quiz-result {
     touch-action: manipulation;
   }
 
