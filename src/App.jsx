@@ -54,6 +54,19 @@ async function apiLogin(email, password) {
   return data; // { access_token, refresh_token, user, ... }
 }
 
+async function apiRefreshSession(refreshToken) {
+  const res = await fetch(`${AUTH}/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error_description || data.msg || "Session expired — please sign in again.");
+  }
+  return data;
+}
+
 async function apiLogout(accessToken) {
   try {
     await fetch(`${AUTH}/logout`, {
@@ -62,6 +75,36 @@ async function apiLogout(accessToken) {
     });
   } catch {
     /* best-effort — clearing local state below is what actually matters */
+  }
+}
+
+// "Keep me signed in" persists only the refresh token (not the access token
+// or password) to localStorage. Skipped entirely inside the Claude artifact
+// preview, where localStorage isn't supported.
+const SESSION_STORAGE_KEY = "dinnerPlannerSession";
+
+function saveRememberedSession(refreshToken) {
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ refresh_token: refreshToken }));
+  } catch {
+    /* private-browsing or storage disabled — remembering just won't persist */
+  }
+}
+
+function clearRememberedSession() {
+  try {
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    /* nothing to do */
+  }
+}
+
+function loadRememberedSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -376,6 +419,7 @@ const EMPTY_RECIPE_FORM = {
   instructions: "",
   sourceUrl: "",
   tags: [],
+  rating: 0,
 };
 
 // ---------- helpers ----------
@@ -416,8 +460,35 @@ function timeLabel(minutes) {
 function parseIngredientLines(text) {
   return (text || "")
     .split(/\r?\n|,/)
-    .map((s) => s.trim())
+    .map((s) => s.trim().replace(/^[-*•]\s+/, ""))
     .filter(Boolean);
+}
+
+// Auto-continues a "- " bullet onto the next line when Enter is pressed,
+// and ends the list if Enter is pressed on an already-empty bullet line.
+function handleBulletKeyDown(e, value, setValue) {
+  if (e.key !== "Enter") return;
+  const ta = e.target;
+  const pos = ta.selectionStart;
+  const lineStart = value.lastIndexOf("\n", pos - 1) + 1;
+  const currentLine = value.slice(lineStart, pos);
+  const match = currentLine.match(/^(\s*)[-*•]\s+/);
+  if (!match) return;
+  e.preventDefault();
+  const [prefix, indent] = match;
+  const restOfLine = currentLine.slice(prefix.length);
+  let newValue, newPos;
+  if (restOfLine.trim() === "") {
+    // Empty bullet — remove it instead of continuing the list forever.
+    newValue = value.slice(0, lineStart) + value.slice(pos);
+    newPos = lineStart;
+  } else {
+    const insertion = "\n" + indent + "- ";
+    newValue = value.slice(0, pos) + insertion + value.slice(pos);
+    newPos = pos + insertion.length;
+  }
+  setValue(newValue);
+  requestAnimationFrame(() => ta.setSelectionRange(newPos, newPos));
 }
 
 const INGREDIENT_UNIT_WORDS = new Set([
@@ -562,10 +633,12 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
           instructions: initial.instructions,
           sourceUrl: initial.sourceUrl || "",
           tags: initial.tags || [],
+          rating: initial.rating || 0,
         }
       : EMPTY_RECIPE_FORM
   );
   const [tagInput, setTagInput] = useState("");
+  const [recipeTab, setRecipeTab] = useState("ingredients"); // "ingredients" | "instructions"
 
   const update = (field) => (e) => setForm({ ...form, [field]: e.target.value });
   const isValid = !!form.name.trim();
@@ -597,7 +670,7 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
       instructions: form.instructions.trim(),
       sourceUrl: form.sourceUrl.trim(),
       tags: form.tags,
-      rating: initial ? initial.rating : 0,
+      rating: form.rating,
     });
   };
 
@@ -653,15 +726,50 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
           </label>
         </div>
 
-        <label className="sb-field sb-field-wide">
-          <span>Ingredients</span>
-          <textarea rows={3} value={form.ingredients} onChange={update("ingredients")} placeholder="One per line, or comma separated" />
-        </label>
+        <div className="sb-recipe-tabs">
+          <button
+            type="button"
+            className={"sb-recipe-tab" + (recipeTab === "ingredients" ? " sb-recipe-tab-active" : "")}
+            onClick={() => setRecipeTab("ingredients")}
+          >
+            Ingredients
+          </button>
+          <button
+            type="button"
+            className={"sb-recipe-tab" + (recipeTab === "instructions" ? " sb-recipe-tab-active" : "")}
+            onClick={() => setRecipeTab("instructions")}
+          >
+            Instructions
+          </button>
+        </div>
 
-        <label className="sb-field sb-field-wide">
-          <span>Instructions (optional)</span>
-          <textarea rows={3} value={form.instructions} onChange={update("instructions")} placeholder="Quick steps" />
-        </label>
+        {recipeTab === "ingredients" ? (
+          <label className="sb-field sb-field-wide">
+            <span className="sb-visually-hidden">Ingredients</span>
+            <textarea
+              rows={12}
+              className="sb-textarea-large"
+              value={form.ingredients}
+              onChange={update("ingredients")}
+              onKeyDown={(e) => handleBulletKeyDown(e, form.ingredients, (v) => setForm((f) => ({ ...f, ingredients: v })))}
+              placeholder={"- 2 cups flour\n- 1 onion, diced\n- 2 cloves garlic"}
+              autoFocus
+            />
+          </label>
+        ) : (
+          <label className="sb-field sb-field-wide">
+            <span className="sb-visually-hidden">Instructions (optional)</span>
+            <textarea
+              rows={12}
+              className="sb-textarea-large"
+              value={form.instructions}
+              onChange={update("instructions")}
+              onKeyDown={(e) => handleBulletKeyDown(e, form.instructions, (v) => setForm((f) => ({ ...f, instructions: v })))}
+              placeholder={"- Preheat oven to 400\u00b0F\n- Season and sear the chicken\n- Roast for 20 minutes"}
+              autoFocus
+            />
+          </label>
+        )}
 
         <label className="sb-field sb-field-wide">
           <span>Tags</span>
@@ -698,6 +806,11 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
               ))}
             </div>
           )}
+        </label>
+
+        <label className="sb-field sb-field-wide">
+          <span>Family rating</span>
+          <Stars value={form.rating} onChange={(n) => setForm({ ...form, rating: n === form.rating ? 0 : n })} size={22} />
         </label>
 
         <div className="sb-sheet-actions">
@@ -889,11 +1002,12 @@ function AssignPanel({ date, recipes, onAssign, onClose, onOpenQuiz }) {
 function LoginScreen({ onLogin, error, loading }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [rememberMe, setRememberMe] = useState(true);
 
   const submit = (e) => {
     e.preventDefault();
     if (!email.trim() || !password) return;
-    onLogin(email.trim(), password);
+    onLogin(email.trim(), password, rememberMe);
   };
 
   return (
@@ -925,6 +1039,11 @@ function LoginScreen({ onLogin, error, loading }) {
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"
               />
+            </label>
+
+            <label className="sb-login-remember">
+              <input type="checkbox" checked={rememberMe} onChange={(e) => setRememberMe(e.target.checked)} />
+              <span>Keep me signed in on this device</span>
             </label>
 
             {error && <p className="sb-login-error">{error}</p>}
@@ -1422,6 +1541,7 @@ export default function SupperBoard() {
   const [session, setSession] = useState(() =>
     isPreviewSandbox ? { access_token: null, user: { email: "preview@local" } } : null
   );
+  const [restoringSession, setRestoringSession] = useState(!isPreviewSandbox);
   const [authError, setAuthError] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
 
@@ -1445,13 +1565,42 @@ export default function SupperBoard() {
   const [shoppingOpen, setShoppingOpen] = useState(false);
   const [shoppingItems, setShoppingItems] = useState([]);
 
-  const handleLogin = async (email, password) => {
+  // ---- try to silently restore a "remembered" session on first load ----
+  useEffect(() => {
+    if (isPreviewSandbox) return;
+    let cancelled = false;
+    (async () => {
+      const remembered = loadRememberedSession();
+      if (!remembered || !remembered.refresh_token) {
+        setRestoringSession(false);
+        return;
+      }
+      try {
+        const data = await apiRefreshSession(remembered.refresh_token);
+        if (cancelled) return;
+        currentAccessToken = data.access_token;
+        setSession(data);
+        saveRememberedSession(data.refresh_token); // Supabase rotates refresh tokens
+      } catch {
+        clearRememberedSession();
+      } finally {
+        if (!cancelled) setRestoringSession(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleLogin = async (email, password, rememberMe) => {
     setAuthLoading(true);
     setAuthError("");
     try {
       const data = await apiLogin(email, password);
       currentAccessToken = data.access_token;
       setSession(data);
+      if (rememberMe) saveRememberedSession(data.refresh_token);
+      else clearRememberedSession();
     } catch (err) {
       setAuthError(err.message);
     } finally {
@@ -1462,6 +1611,7 @@ export default function SupperBoard() {
   const handleLogout = async () => {
     if (session) await apiLogout(session.access_token);
     currentAccessToken = null;
+    clearRememberedSession();
     setSession(null);
     // Reset app state so the next login starts from a clean load.
     setRecipes([]);
@@ -1514,6 +1664,8 @@ export default function SupperBoard() {
     setHoverDate(null);
     hoverDateRef.current = null;
     if (ghostElRef.current) ghostElRef.current.style.display = "none";
+    document.body.style.webkitUserSelect = "";
+    document.body.style.userSelect = "";
   };
 
   const suppressNextClick = () => {
@@ -1596,6 +1748,8 @@ export default function SupperBoard() {
         setDragActiveKey(ds.key);
         setDragRecipeName(ds.recipe.name);
         if (ghostElRef.current) ghostElRef.current.style.display = "block";
+        document.body.style.webkitUserSelect = "none";
+        document.body.style.userSelect = "none";
       }
       return; // touch just waits for the hold timer
     }
@@ -1655,6 +1809,8 @@ export default function SupperBoard() {
           ghostElRef.current.style.display = "block";
           positionGhost(dragSession.startX, dragSession.startY);
         }
+        document.body.style.webkitUserSelect = "none";
+        document.body.style.userSelect = "none";
       }, TOUCH_HOLD_MS);
     }
   };
@@ -1912,6 +2068,15 @@ export default function SupperBoard() {
   }, [recipes, boxSearch, boxCuisine, boxProtein, boxTag, boxSort]);
 
   const boxFiltersActive = boxSearch.trim() || boxCuisine || boxProtein || boxTag || boxSort !== "name";
+
+  if (restoringSession) {
+    return (
+      <div className="sb-app">
+        <style>{BASE_STYLES}</style>
+        <p className="sb-loading">Checking your sign-in...</p>
+      </div>
+    );
+  }
 
   if (!session) {
     return <LoginScreen onLogin={handleLogin} error={authError} loading={authLoading} />;
@@ -2199,6 +2364,15 @@ const BASE_STYLES = `
   }
   .sb-login-title { color: var(--chalk); font-size: 28px; margin-bottom: 6px; }
   .sb-login-sub { font-size: 13px; color: #6b6250; margin: 0 0 22px; }
+  .sb-login-remember {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #6b6250;
+    margin: -6px 0 16px;
+    cursor: pointer;
+  }
   .sb-login-error {
     background: #FBEAE6;
     border: 1px solid #E2B3A7;
@@ -2445,7 +2619,15 @@ const BASE_STYLES = `
     grid-template-columns: repeat(7, minmax(120px, 1fr));
     gap: 14px;
   }
-  .sb-day-col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .sb-day-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
   .sb-day-col-hover {
     outline: 2px solid var(--herb);
     outline-offset: 4px;
@@ -2503,6 +2685,13 @@ const BASE_STYLES = `
     box-shadow: 0 1px 2px rgba(0,0,0,0.08);
     touch-action: none;
     user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .sb-card * {
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
   }
   .sb-card-dragging {
     opacity: 0.35;
@@ -2734,6 +2923,47 @@ const BASE_STYLES = `
   .sb-field input:focus, .sb-field select:focus, .sb-field textarea:focus {
     outline: none;
     border-color: var(--herb);
+  }
+  .sb-textarea-large {
+    min-height: 190px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+  }
+  .sb-visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .sb-recipe-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid #E4D6AC;
+  }
+  .sb-recipe-tab {
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: #8a8168;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 4px;
+    margin-bottom: -1px;
+    cursor: pointer;
+  }
+  .sb-recipe-tab + .sb-recipe-tab { margin-left: 12px; }
+  .sb-recipe-tab-active {
+    color: var(--herb);
+    border-bottom-color: var(--herb);
   }
   .sb-form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
 
