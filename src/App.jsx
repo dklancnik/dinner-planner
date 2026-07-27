@@ -185,6 +185,28 @@ async function apiUploadRecipePhoto(file, recipeId) {
   return `${SUPABASE_URL}/storage/v1/object/public/${RECIPE_PHOTO_BUCKET}/${path}`;
 }
 
+// Deletes a photo from Storage given its public URL. Best-effort: a recipe
+// should still get deleted even if this fails for some reason.
+async function apiDeleteRecipePhoto(photoUrl) {
+  if (!photoUrl) return;
+  const marker = `/storage/v1/object/public/${RECIPE_PHOTO_BUCKET}/`;
+  const idx = photoUrl.indexOf(marker);
+  if (idx === -1) return; // not a photo stored in our bucket, nothing to clean up
+  const path = photoUrl.slice(idx + marker.length);
+  try {
+    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${RECIPE_PHOTO_BUCKET}/${path}`, {
+      method: "DELETE",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${currentAccessToken || SUPABASE_KEY}`,
+      },
+    });
+    if (!res.ok) console.error("Couldn't delete recipe photo:", res.status);
+  } catch (err) {
+    console.error("Couldn't delete recipe photo:", err);
+  }
+}
+
 async function apiListRecipes() {
   const res = await fetch(`${REST}/recipes?select=*`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Couldn't load recipes (${res.status})`);
@@ -797,10 +819,18 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
     });
   };
 
+  // Closing the card (× or clicking outside) auto-saves any valid changes
+  // instead of discarding them. A brand-new recipe with no name yet still
+  // just cancels, since there's nothing meaningful to save.
+  const handleClose = () => {
+    if (isValid) submit();
+    else onCancel();
+  };
+
   return (
-    <div className="sb-modal-backdrop" onClick={onCancel}>
+    <div className="sb-modal-backdrop" onClick={handleClose}>
       <div className="sb-sheet" onClick={(e) => e.stopPropagation()}>
-        <button type="button" className="sb-sheet-close" onClick={onCancel} aria-label="Close">
+        <button type="button" className="sb-sheet-close" onClick={handleClose} aria-label="Close">
           ×
         </button>
         <h2 className="sb-sheet-title">{initial ? "Edit recipe" : "Add a recipe"}</h2>
@@ -2049,8 +2079,12 @@ export default function SupperBoard() {
       return;
     }
     try {
+      const recipeBeingDeleted = recipes.find((r) => r.id === id);
       await apiDeleteRecipe(id);
       await apiDeleteAssignmentsByRecipe(id);
+      if (recipeBeingDeleted?.photoUrl) {
+        apiDeleteRecipePhoto(recipeBeingDeleted.photoUrl); // best-effort, not awaited-critical
+      }
       setRecipes((prev) => prev.filter((r) => r.id !== id));
       setCalendar(clearFromCalendar);
       setEditingRecipe(null);
