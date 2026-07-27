@@ -200,6 +200,51 @@ async function apiUnassignDate(dateStr) {
   if (!res.ok) throw new Error(`Couldn't clear that day (${res.status})`);
 }
 
+// ---------- shopping list ----------
+
+async function apiListShoppingItems() {
+  const res = await fetch(`${REST}/shopping_list_items?select=*&order=created_at.asc`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`Couldn't load the shopping list (${res.status})`);
+  return res.json();
+}
+
+async function apiInsertShoppingItems(items) {
+  if (items.length === 0) return [];
+  const res = await fetch(`${REST}/shopping_list_items`, {
+    method: "POST",
+    headers: { ...authHeaders(), Prefer: "return=representation" },
+    body: JSON.stringify(items),
+  });
+  if (!res.ok) throw new Error(`Couldn't add items (${res.status})`);
+  return res.json();
+}
+
+async function apiUpdateShoppingItem(id, checked) {
+  const res = await fetch(`${REST}/shopping_list_items?id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: authHeaders(),
+    body: JSON.stringify({ checked }),
+  });
+  if (!res.ok) throw new Error(`Couldn't update that item (${res.status})`);
+}
+
+async function apiDeleteShoppingItem(id) {
+  const res = await fetch(`${REST}/shopping_list_items?id=eq.${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(`Couldn't remove that item (${res.status})`);
+}
+
+async function apiDeleteShoppingItems(ids) {
+  if (ids.length === 0) return;
+  const res = await fetch(`${REST}/shopping_list_items?id=in.(${ids.map(encodeURIComponent).join(",")})`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(`Couldn't clear those items (${res.status})`);
+}
+
 // ---------- constants ----------
 
 const CUISINES = ["Italian", "Mexican", "American", "Asian", "Mediterranean", "Indian", "Other"];
@@ -325,6 +370,42 @@ function nextTwoWeeks() {
 function timeLabel(minutes) {
   const bucket = TIME_BUCKETS.find((b) => minutes <= b.max);
   return bucket ? bucket.label : `${minutes} min`;
+}
+
+// ---------- shopping list helpers ----------
+
+// Splits a recipe's free-text ingredients field into individual lines.
+function parseIngredientLines(text) {
+  return (text || "")
+    .split(/\r?\n|,/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+const INGREDIENT_UNIT_WORDS = new Set([
+  "cup", "cups", "tbsp", "tablespoon", "tablespoons", "tsp", "teaspoon", "teaspoons",
+  "oz", "ounce", "ounces", "lb", "lbs", "pound", "pounds", "clove", "cloves",
+  "can", "cans", "g", "kg", "ml", "l", "pinch", "slice", "slices",
+  "large", "medium", "small", "of",
+]);
+
+// A rough normalized key for spotting duplicate ingredients across recipes,
+// e.g. "2 cups flour" and "1 cup all-purpose flour" both key close to "flour".
+// This is intentionally approximate, not a precise unit-aware merge.
+function normalizeIngredientKey(line) {
+  let s = line.toLowerCase().replace(/^[\d\s./-]+/, "");
+  const words = s.split(/\s+/).filter(Boolean);
+  while (words.length && INGREDIENT_UNIT_WORDS.has(words[0].replace(/[,.]$/, ""))) {
+    words.shift();
+  }
+  s = words.join(" ").replace(/[.,]+$/, "").trim();
+  if (s.endsWith("es")) s = s.slice(0, -2);
+  else if (s.endsWith("s") && !s.endsWith("ss")) s = s.slice(0, -1);
+  return s || line.toLowerCase().trim();
+}
+
+function newShoppingItemId() {
+  return "s" + Date.now() + Math.random().toString(36).slice(2, 7);
 }
 
 // ---------- small shared components ----------
@@ -1031,10 +1112,189 @@ function SettingsPanel({ onClose }) {
   );
 }
 
+// The Claude artifact preview exposes window.storage; a real deployed site
+// never will. Used only to skip the login gate in-chat so the design can be
+// reviewed without live Supabase access — has zero effect once deployed.
+const isPreviewSandbox = typeof window !== "undefined" && !!window.storage;
+
+// ---------- shopping list panel ----------
+
+function ShoppingListPanel({ items, onAddItems, onToggle, onRemove, onClearChecked, days, calendar, recipeById, onClose }) {
+  const [selectedDays, setSelectedDays] = useState(() => new Set());
+  const [manualText, setManualText] = useState("");
+  const [note, setNote] = useState("");
+
+  const scheduledDays = days
+    .map((d) => ({ d, key: isoDate(d), recipe: calendar[isoDate(d)] ? recipeById(calendar[isoDate(d)]) : null }))
+    .filter((row) => row.recipe);
+
+  const toggleDaySelection = (key) => {
+    setSelectedDays((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const selectAllScheduled = () => {
+    setSelectedDays(new Set(scheduledDays.map((row) => row.key)));
+  };
+
+  const addFromSelectedDays = () => {
+    setNote("");
+    const chosenRecipes = [];
+    const seenRecipeIds = new Set();
+    scheduledDays.forEach((row) => {
+      if (selectedDays.has(row.key) && !seenRecipeIds.has(row.recipe.id)) {
+        seenRecipeIds.add(row.recipe.id);
+        chosenRecipes.push(row.recipe);
+      }
+    });
+    if (chosenRecipes.length === 0) {
+      setNote("Pick at least one dinner first.");
+      return;
+    }
+
+    const existingKeys = new Set(items.map((i) => normalizeIngredientKey(i.text)));
+    const seenNew = new Set();
+    const newLines = [];
+    chosenRecipes.forEach((r) => {
+      parseIngredientLines(r.ingredients).forEach((line) => {
+        const key = normalizeIngredientKey(line);
+        if (existingKeys.has(key) || seenNew.has(key)) return;
+        seenNew.add(key);
+        newLines.push(line);
+      });
+    });
+
+    if (newLines.length === 0) {
+      setNote("Everything from those dinners is already on your list.");
+      return;
+    }
+
+    const newItems = newLines.map((text) => ({ id: newShoppingItemId(), text, checked: false }));
+    onAddItems(newItems);
+    setSelectedDays(new Set());
+    setNote(`Added ${newLines.length} item${newLines.length === 1 ? "" : "s"}.`);
+  };
+
+  const addManualItem = (e) => {
+    e.preventDefault();
+    const text = manualText.trim();
+    if (!text) return;
+    onAddItems([{ id: newShoppingItemId(), text, checked: false }]);
+    setManualText("");
+  };
+
+  const unchecked = items.filter((i) => !i.checked);
+  const checked = items.filter((i) => i.checked);
+
+  return (
+    <div className="sb-modal-backdrop" onClick={onClose}>
+      <div className="sb-sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="sb-eyebrow">family grocery list</div>
+        <h2 className="sb-sheet-title">Shopping list</h2>
+
+        <div className="sb-shop-section">
+          <div className="sb-quiz-question" style={{ marginBottom: 8 }}>
+            Add ingredients from this week's dinners
+          </div>
+          {scheduledDays.length === 0 ? (
+            <p className="sb-empty-note">No dinners scheduled yet — assign some on the calendar first.</p>
+          ) : (
+            <>
+              <div className="sb-shop-day-list">
+                {scheduledDays.map((row) => (
+                  <label key={row.key} className="sb-shop-day-row">
+                    <input
+                      type="checkbox"
+                      checked={selectedDays.has(row.key)}
+                      onChange={() => toggleDaySelection(row.key)}
+                    />
+                    <span className="sb-shop-day-label">
+                      {fmtDay(row.d)} {fmtDate(row.d)}
+                    </span>
+                    <span className="sb-shop-day-recipe">{row.recipe.name}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="sb-shop-day-actions">
+                <button type="button" className="sb-btn-ghost sb-btn-small" onClick={selectAllScheduled}>
+                  select all
+                </button>
+                <button type="button" className="sb-btn-solid sb-btn-small" onClick={addFromSelectedDays}>
+                  add ingredients to list
+                </button>
+              </div>
+              {note && <p className="sb-empty-note" style={{ marginTop: 6 }}>{note}</p>}
+            </>
+          )}
+        </div>
+
+        <div className="sb-quiz-question" style={{ margin: "20px 0 10px" }}>
+          The list ({unchecked.length} to get{checked.length > 0 ? `, ${checked.length} done` : ""})
+        </div>
+
+        <form onSubmit={addManualItem} className="sb-shop-add-row">
+          <input
+            value={manualText}
+            onChange={(e) => setManualText(e.target.value)}
+            placeholder="Add an item, e.g. paper towels"
+          />
+          <button className="sb-btn-solid sb-btn-small" type="submit">
+            add
+          </button>
+        </form>
+
+        {items.length === 0 ? (
+          <p className="sb-empty-note">Your list is empty — add dinners above or type an item in.</p>
+        ) : (
+          <div className="sb-shop-items">
+            {unchecked.map((i) => (
+              <label key={i.id} className="sb-shop-item-row">
+                <input type="checkbox" checked={false} onChange={() => onToggle(i.id, true)} />
+                <span className="sb-shop-item-text">{i.text}</span>
+                <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
+                  ×
+                </button>
+              </label>
+            ))}
+            {checked.map((i) => (
+              <label key={i.id} className="sb-shop-item-row sb-shop-item-checked">
+                <input type="checkbox" checked={true} onChange={() => onToggle(i.id, false)} />
+                <span className="sb-shop-item-text">{i.text}</span>
+                <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
+                  ×
+                </button>
+              </label>
+            ))}
+          </div>
+        )}
+
+        <div className="sb-sheet-actions">
+          {checked.length > 0 ? (
+            <button className="sb-btn-ghost sb-btn-danger" onClick={onClearChecked}>
+              clear checked items
+            </button>
+          ) : (
+            <div />
+          )}
+          <button className="sb-btn-ghost" onClick={onClose}>
+            close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---------- main app ----------
 
 export default function SupperBoard() {
-  const [session, setSession] = useState(null); // { access_token, user } | null
+  const [session, setSession] = useState(() =>
+    isPreviewSandbox ? { access_token: null, user: { email: "preview@local" } } : null
+  );
   const [authError, setAuthError] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
 
@@ -1055,6 +1315,8 @@ export default function SupperBoard() {
   const [quizOpen, setQuizOpen] = useState(false); // bool, standalone quiz from header
   const [quizForDate, setQuizForDate] = useState(null); // Date | null, quiz launched from a slot
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [shoppingOpen, setShoppingOpen] = useState(false);
+  const [shoppingItems, setShoppingItems] = useState([]);
 
   const handleLogin = async (email, password) => {
     setAuthLoading(true);
@@ -1142,6 +1404,10 @@ export default function SupperBoard() {
 
     if (!sourceDate) {
       // Dragged straight from the recipe box — just assign (overwrite if occupied).
+      if (isPreviewSandbox) {
+        setCalendar((prev) => ({ ...prev, [dropDateStr]: recipe.id }));
+        return;
+      }
       try {
         await apiAssignDate(dropDateStr, recipe.id);
         setCalendar((prev) => ({ ...prev, [dropDateStr]: recipe.id }));
@@ -1158,7 +1424,7 @@ export default function SupperBoard() {
 
     const destRecipeId = calendarRef.current[dropDateStr] || null;
 
-    // Optimistic local update.
+    // Optimistic local update (this is also the final state in preview mode).
     setCalendar((prev) => {
       const next = { ...prev };
       if (destRecipeId) next[sourceStr] = destRecipeId;
@@ -1166,6 +1432,8 @@ export default function SupperBoard() {
       next[dropDateStr] = recipe.id;
       return next;
     });
+
+    if (isPreviewSandbox) return;
 
     try {
       if (destRecipeId) {
@@ -1279,9 +1547,20 @@ export default function SupperBoard() {
 
         const calendarValue = await apiListCalendar();
         setCalendar(calendarValue);
+
+        const shoppingValue = await apiListShoppingItems();
+        setShoppingItems(shoppingValue);
       } catch (err) {
         console.error("Dinner Planner load error:", err);
-        setLoadError(true);
+        if (isPreviewSandbox) {
+          // Chat preview can't reach Supabase at all — show local demo data
+          // instead of an error so the design can still be reviewed.
+          setRecipes(SEED_RECIPES);
+          setCalendar({});
+          setShoppingItems([]);
+        } else {
+          setLoadError(true);
+        }
       } finally {
         setLoading(false);
       }
@@ -1289,6 +1568,12 @@ export default function SupperBoard() {
   }, [session]);
 
   const saveRecipe = async (recipe) => {
+    if (isPreviewSandbox) {
+      const exists = recipes.some((r) => r.id === recipe.id);
+      setRecipes((prev) => (exists ? prev.map((r) => (r.id === recipe.id ? recipe : r)) : [...prev, recipe]));
+      setEditingRecipe(null);
+      return;
+    }
     try {
       const exists = recipes.some((r) => r.id === recipe.id);
       const saved = exists ? await apiUpdateRecipe(recipe) : await apiInsertRecipe(recipe);
@@ -1302,17 +1587,25 @@ export default function SupperBoard() {
   };
 
   const deleteRecipe = async (id) => {
+    const clearFromCalendar = (prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((date) => {
+        if (next[date] === id) delete next[date];
+      });
+      return next;
+    };
+
+    if (isPreviewSandbox) {
+      setRecipes((prev) => prev.filter((r) => r.id !== id));
+      setCalendar(clearFromCalendar);
+      setEditingRecipe(null);
+      return;
+    }
     try {
       await apiDeleteRecipe(id);
       setRecipes((prev) => prev.filter((r) => r.id !== id));
       // The calendar_assignments table cascades on delete, so clear it locally too.
-      setCalendar((prev) => {
-        const next = { ...prev };
-        Object.keys(next).forEach((date) => {
-          if (next[date] === id) delete next[date];
-        });
-        return next;
-      });
+      setCalendar(clearFromCalendar);
       setEditingRecipe(null);
       setActionError("");
     } catch (err) {
@@ -1322,6 +1615,10 @@ export default function SupperBoard() {
   };
 
   const rateRecipe = async (id, rating) => {
+    if (isPreviewSandbox) {
+      setRecipes((prev) => prev.map((r) => (r.id === id ? { ...r, rating } : r)));
+      return;
+    }
     try {
       const saved = await apiUpdateRating(id, rating);
       setRecipes((prev) => prev.map((r) => (r.id === id ? saved : r)));
@@ -1334,6 +1631,12 @@ export default function SupperBoard() {
 
   const assignToDate = async (date, recipe) => {
     const key = isoDate(date);
+    if (isPreviewSandbox) {
+      setCalendar((prev) => ({ ...prev, [key]: recipe.id }));
+      setAssignDate(null);
+      setQuizForDate(null);
+      return;
+    }
     try {
       await apiAssignDate(key, recipe.id);
       setCalendar((prev) => ({ ...prev, [key]: recipe.id }));
@@ -1348,6 +1651,14 @@ export default function SupperBoard() {
 
   const unassignDate = async (date) => {
     const key = isoDate(date);
+    if (isPreviewSandbox) {
+      setCalendar((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      return;
+    }
     try {
       await apiUnassignDate(key);
       setCalendar((prev) => {
@@ -1363,6 +1674,55 @@ export default function SupperBoard() {
   };
 
   const recipeById = (id) => recipes.find((r) => r.id === id);
+
+  const addShoppingItems = async (newItems) => {
+    setShoppingItems((prev) => [...prev, ...newItems]);
+    if (isPreviewSandbox) return;
+    try {
+      await apiInsertShoppingItems(newItems);
+      setActionError("");
+    } catch (err) {
+      console.error(err);
+      setActionError(err.message);
+    }
+  };
+
+  const toggleShoppingItem = async (id, checkedValue) => {
+    setShoppingItems((prev) => prev.map((i) => (i.id === id ? { ...i, checked: checkedValue } : i)));
+    if (isPreviewSandbox) return;
+    try {
+      await apiUpdateShoppingItem(id, checkedValue);
+      setActionError("");
+    } catch (err) {
+      console.error(err);
+      setActionError(err.message);
+    }
+  };
+
+  const removeShoppingItem = async (id) => {
+    setShoppingItems((prev) => prev.filter((i) => i.id !== id));
+    if (isPreviewSandbox) return;
+    try {
+      await apiDeleteShoppingItem(id);
+      setActionError("");
+    } catch (err) {
+      console.error(err);
+      setActionError(err.message);
+    }
+  };
+
+  const clearCheckedShoppingItems = async () => {
+    const checkedIds = shoppingItems.filter((i) => i.checked).map((i) => i.id);
+    setShoppingItems((prev) => prev.filter((i) => !i.checked));
+    if (isPreviewSandbox || checkedIds.length === 0) return;
+    try {
+      await apiDeleteShoppingItems(checkedIds);
+      setActionError("");
+    } catch (err) {
+      console.error(err);
+      setActionError(err.message);
+    }
+  };
 
   const allTags = useMemo(() => {
     const set = new Set();
@@ -1408,7 +1768,9 @@ export default function SupperBoard() {
 
       <div className="sb-header">
         <div>
-          <div className="sb-eyebrow sb-eyebrow-light">the family menu, two weeks out</div>
+          <div className="sb-eyebrow sb-eyebrow-light">
+            the family menu, two weeks out{isPreviewSandbox && <span className="sb-preview-badge">preview mode</span>}
+          </div>
           <h1 className="sb-title">Dinner Planner</h1>
         </div>
         <div className="sb-header-actions">
@@ -1418,16 +1780,40 @@ export default function SupperBoard() {
           <button className="sb-btn-solid" onClick={() => setEditingRecipe("new")}>
             + add recipe
           </button>
-          <button className="sb-btn-icon" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
-            ⚙
+          <button className="sb-btn-icon" onClick={() => setShoppingOpen(true)} aria-label="Shopping list" title="Shopping list">
+            🛒
+            {shoppingItems.some((i) => !i.checked) && (
+              <span className="sb-cart-badge">{shoppingItems.filter((i) => !i.checked).length}</span>
+            )}
           </button>
-          <button className="sb-btn-ghost-light" onClick={handleLogout}>
-            log out
-          </button>
+          {!isPreviewSandbox && (
+            <button className="sb-btn-icon" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
+              ⚙
+            </button>
+          )}
+          {!isPreviewSandbox && (
+            <button className="sb-btn-ghost-light" onClick={handleLogout}>
+              log out
+            </button>
+          )}
         </div>
       </div>
 
       {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+
+      {shoppingOpen && (
+        <ShoppingListPanel
+          items={shoppingItems}
+          onAddItems={addShoppingItems}
+          onToggle={toggleShoppingItem}
+          onRemove={removeShoppingItem}
+          onClearChecked={clearCheckedShoppingItems}
+          days={days}
+          calendar={calendar}
+          recipeById={recipeById}
+          onClose={() => setShoppingOpen(false)}
+        />
+      )}
 
       {loadError && (
         <p className="sb-empty-note" style={{ padding: "12px 28px 0", color: "#C1442E" }}>
@@ -1679,6 +2065,16 @@ const BASE_STYLES = `
     margin-bottom: 6px;
   }
   .sb-eyebrow-light { color: #B7CBBB; }
+  .sb-preview-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 8px;
+    background: var(--marigold);
+    color: #3A2504;
+    border-radius: 10px;
+    font-size: 9px;
+    letter-spacing: 0.5px;
+  }
   .sb-title {
     font-family: 'Zilla Slab', serif;
     font-weight: 700;
@@ -1702,6 +2098,99 @@ const BASE_STYLES = `
     flex-shrink: 0;
   }
   .sb-btn-icon:hover { background: rgba(255,255,255,0.16); }
+  .sb-btn-icon { position: relative; }
+  .sb-cart-badge {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    background: var(--tomato);
+    color: #fff;
+    font-family: 'Inter', sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    min-width: 17px;
+    height: 17px;
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px;
+  }
+
+  .sb-shop-section {
+    border: 1px solid #E4D6AC;
+    border-radius: 6px;
+    padding: 16px;
+  }
+  .sb-shop-day-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 12px;
+    max-height: 160px;
+    overflow-y: auto;
+  }
+  .sb-shop-day-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .sb-shop-day-row input { flex-shrink: 0; }
+  .sb-shop-day-label {
+    font-family: 'Inter', sans-serif;
+    font-weight: 700;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--herb);
+    flex-shrink: 0;
+    min-width: 74px;
+  }
+  .sb-shop-day-recipe { color: var(--ink); }
+  .sb-shop-day-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .sb-shop-add-row { display: flex; gap: 8px; margin-bottom: 14px; }
+  .sb-shop-add-row input {
+    flex: 1;
+    font-family: 'Inter', sans-serif;
+    font-size: 14px;
+    padding: 9px 10px;
+    border: 1px solid #D6C89A;
+    border-radius: 4px;
+    background: #fff;
+    color: var(--ink);
+  }
+
+  .sb-shop-items {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: 16px;
+    max-height: 280px;
+    overflow-y: auto;
+  }
+  .sb-shop-item-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 4px;
+    border-bottom: 1px solid #E4D6AC;
+    cursor: pointer;
+  }
+  .sb-shop-item-text { flex: 1; font-size: 14px; color: var(--ink); }
+  .sb-shop-item-checked .sb-shop-item-text { text-decoration: line-through; color: #a39c82; }
+  .sb-shop-item-remove {
+    background: none;
+    border: none;
+    color: #a39c82;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+  }
+  .sb-shop-item-remove:hover { color: var(--tomato); }
 
   .sb-settings-add {
     border: 1px solid #E4D6AC;
