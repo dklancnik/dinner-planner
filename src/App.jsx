@@ -18,6 +18,11 @@ import { useState, useEffect, useMemo, useRef } from "react";
 
 const SUPABASE_URL = "https://cyxnxoeerlxanjltxhdp.supabase.co";
 const SUPABASE_KEY = "sb_publishable_4jQAFzZO52uLigenwuJ9Ng_iVxVgXHm";
+
+// Only this account can see/use the settings (user management) panel.
+// Enforced here in the UI AND server-side in api/manage-users.js — the UI
+// check alone wouldn't stop someone from calling that endpoint directly.
+const ADMIN_EMAIL = "dklancnik@gmail.com";
 const REST = `${SUPABASE_URL}/rest/v1`;
 const AUTH = `${SUPABASE_URL}/auth/v1`;
 
@@ -205,15 +210,29 @@ async function apiUnassignDate(dateStr) {
 async function apiListShoppingItems() {
   const res = await fetch(`${REST}/shopping_list_items?select=*&order=created_at.asc`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`Couldn't load the shopping list (${res.status})`);
-  return res.json();
+  const rows = await res.json();
+  return rows.map((row) => ({
+    id: row.id,
+    text: row.text,
+    checked: row.checked,
+    sources: row.sources || [],
+    haveAtHome: row.have_at_home || false,
+  }));
 }
 
 async function apiInsertShoppingItems(items) {
   if (items.length === 0) return [];
+  const dbItems = items.map((i) => ({
+    id: i.id,
+    text: i.text,
+    checked: i.checked,
+    sources: i.sources || [],
+    have_at_home: i.haveAtHome || false,
+  }));
   const res = await fetch(`${REST}/shopping_list_items`, {
     method: "POST",
     headers: { ...authHeaders(), Prefer: "return=representation" },
-    body: JSON.stringify(items),
+    body: JSON.stringify(dbItems),
   });
   if (!res.ok) throw new Error(`Couldn't add items (${res.status})`);
   return res.json();
@@ -233,6 +252,15 @@ async function apiUpdateShoppingItemSources(id, sources) {
     method: "PATCH",
     headers: authHeaders(),
     body: JSON.stringify({ sources }),
+  });
+  if (!res.ok) throw new Error(`Couldn't update that item (${res.status})`);
+}
+
+async function apiUpdateShoppingItemHaveAtHome(id, haveAtHome) {
+  const res = await fetch(`${REST}/shopping_list_items?id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: authHeaders(),
+    body: JSON.stringify({ have_at_home: haveAtHome }),
   });
   if (!res.ok) throw new Error(`Couldn't update that item (${res.status})`);
 }
@@ -377,6 +405,7 @@ function nextTwoWeeks() {
 }
 
 function timeLabel(minutes) {
+  if (minutes == null) return "time not set";
   const bucket = TIME_BUCKETS.find((b) => minutes <= b.max);
   return bucket ? bucket.label : `${minutes} min`;
 }
@@ -415,6 +444,11 @@ function normalizeIngredientKey(line) {
 
 function newShoppingItemId() {
   return "s" + Date.now() + Math.random().toString(36).slice(2, 7);
+}
+
+// Adds https:// if someone pastes a bare domain, so the link still opens correctly.
+function normalizeUrl(url) {
+  return /^https?:\/\//i.test(url) ? url : `https://${url}`;
 }
 
 // ---------- small shared components ----------
@@ -523,7 +557,7 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
           name: initial.name,
           cuisine: initial.cuisine,
           protein: initial.protein,
-          timeMinutes: String(initial.timeMinutes),
+          timeMinutes: initial.timeMinutes != null ? String(initial.timeMinutes) : "",
           ingredients: initial.ingredients,
           instructions: initial.instructions,
           sourceUrl: initial.sourceUrl || "",
@@ -534,7 +568,7 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
   const [tagInput, setTagInput] = useState("");
 
   const update = (field) => (e) => setForm({ ...form, [field]: e.target.value });
-  const isValid = form.name.trim() && Number(form.timeMinutes) > 0;
+  const isValid = !!form.name.trim();
 
   const addTag = () => {
     const clean = tagInput.trim().toLowerCase();
@@ -558,7 +592,7 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
       name: form.name.trim(),
       cuisine: form.cuisine,
       protein: form.protein,
-      timeMinutes: Number(form.timeMinutes),
+      timeMinutes: form.timeMinutes.trim() ? Number(form.timeMinutes) : null,
       ingredients: form.ingredients.trim(),
       instructions: form.instructions.trim(),
       sourceUrl: form.sourceUrl.trim(),
@@ -576,6 +610,15 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
         <label className="sb-field sb-field-wide">
           <span>Found it online? Paste the link (optional)</span>
           <input value={form.sourceUrl} onChange={update("sourceUrl")} placeholder="https://..." />
+          {form.sourceUrl.trim() && (
+            <button
+              type="button"
+              className="sb-source-link"
+              onClick={() => window.open(normalizeUrl(form.sourceUrl.trim()), "_blank", "noopener,noreferrer")}
+            >
+              open link ↗
+            </button>
+          )}
         </label>
 
         <label className="sb-field sb-field-wide">
@@ -605,7 +648,7 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
             </select>
           </label>
           <label className="sb-field">
-            <span>Time (minutes)</span>
+            <span>Time in minutes (optional)</span>
             <input type="number" value={form.timeMinutes} onChange={update("timeMinutes")} placeholder="30" />
           </label>
         </div>
@@ -692,7 +735,7 @@ function PickerQuiz({ recipes, onClose, onPick, targetDateLabel }) {
       let score = 0;
       if (cuisine && r.cuisine === cuisine) score += 1;
       if (protein && r.protein === protein) score += 1;
-      if (timeBucket) {
+      if (timeBucket && r.timeMinutes != null) {
         const bucket = TIME_BUCKETS.find((b) => r.timeMinutes <= b.max);
         if (bucket && bucket.label === timeBucket) score += 1;
       }
@@ -1128,7 +1171,7 @@ const isPreviewSandbox = typeof window !== "undefined" && !!window.storage;
 
 // ---------- shopping list panel ----------
 
-function ShoppingListPanel({ items, onAddItems, onToggle, onRemove, onClearChecked, days, calendar, recipeById, onClose }) {
+function ShoppingListPanel({ items, onAddItems, onToggle, onToggleHaveAtHome, onRemove, onClearChecked, onClearAll, days, calendar, recipeById, onClose }) {
   const [selectedDays, setSelectedDays] = useState(() => new Set());
   const [manualText, setManualText] = useState("");
   const [note, setNote] = useState("");
@@ -1193,6 +1236,7 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onRemove, onClearCheck
       id: newShoppingItemId(),
       text: v.text,
       checked: false,
+      haveAtHome: false,
       sources: [...v.sources],
     }));
 
@@ -1224,7 +1268,7 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onRemove, onClearCheck
     e.preventDefault();
     const text = manualText.trim();
     if (!text) return;
-    onAddItems([{ id: newShoppingItemId(), text, checked: false, sources: [] }]);
+    onAddItems([{ id: newShoppingItemId(), text, checked: false, haveAtHome: false, sources: [] }]);
     setManualText("");
   };
 
@@ -1291,46 +1335,78 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onRemove, onClearCheck
         {items.length === 0 ? (
           <p className="sb-empty-note">Your list is empty — add dinners above or type an item in.</p>
         ) : (
-          <div className="sb-shop-items">
-            {unchecked.map((i) => (
-              <label key={i.id} className="sb-shop-item-row">
-                <input type="checkbox" checked={false} onChange={() => onToggle(i.id, true)} />
-                <span className="sb-shop-item-main">
-                  <span className="sb-shop-item-text">{i.text}</span>
-                  {i.sources && i.sources.length > 0 && (
-                    <span className="sb-shop-item-sources">for {i.sources.join(", ")}</span>
-                  )}
-                </span>
-                <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
-                  ×
-                </button>
-              </label>
-            ))}
-            {checked.map((i) => (
-              <label key={i.id} className="sb-shop-item-row sb-shop-item-checked">
-                <input type="checkbox" checked={true} onChange={() => onToggle(i.id, false)} />
-                <span className="sb-shop-item-main">
-                  <span className="sb-shop-item-text">{i.text}</span>
-                  {i.sources && i.sources.length > 0 && (
-                    <span className="sb-shop-item-sources">for {i.sources.join(", ")}</span>
-                  )}
-                </span>
-                <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
-                  ×
-                </button>
-              </label>
-            ))}
-          </div>
+          <>
+            <div className="sb-shop-col-headers">
+              <span className="sb-shop-col-label">home</span>
+              <span className="sb-shop-col-label">store</span>
+              <span />
+              <span />
+            </div>
+            <div className="sb-shop-items">
+              {unchecked.map((i) => (
+                <div key={i.id} className="sb-shop-item-row">
+                  <input
+                    type="checkbox"
+                    checked={!!i.haveAtHome}
+                    onChange={() => onToggleHaveAtHome(i.id, !i.haveAtHome)}
+                    aria-label="Already have at home"
+                  />
+                  <input type="checkbox" checked={false} onChange={() => onToggle(i.id, true)} aria-label="Store" />
+                  <span className="sb-shop-item-main">
+                    <span className={"sb-shop-item-text" + (i.haveAtHome ? " sb-shop-item-have" : "")}>{i.text}</span>
+                    {i.sources && i.sources.length > 0 && (
+                      <span className="sb-shop-item-sources">for {i.sources.join(", ")}</span>
+                    )}
+                  </span>
+                  <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
+                    ×
+                  </button>
+                </div>
+              ))}
+              {checked.map((i) => (
+                <div key={i.id} className="sb-shop-item-row sb-shop-item-checked">
+                  <input
+                    type="checkbox"
+                    checked={!!i.haveAtHome}
+                    onChange={() => onToggleHaveAtHome(i.id, !i.haveAtHome)}
+                    aria-label="Already have at home"
+                  />
+                  <input type="checkbox" checked={true} onChange={() => onToggle(i.id, false)} aria-label="Store" />
+                  <span className="sb-shop-item-main">
+                    <span className="sb-shop-item-text">{i.text}</span>
+                    {i.sources && i.sources.length > 0 && (
+                      <span className="sb-shop-item-sources">for {i.sources.join(", ")}</span>
+                    )}
+                  </span>
+                  <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          </>
         )}
 
         <div className="sb-sheet-actions">
-          {checked.length > 0 ? (
-            <button className="sb-btn-ghost sb-btn-danger" onClick={onClearChecked}>
-              clear checked items
-            </button>
-          ) : (
-            <div />
-          )}
+          <div className="sb-shop-clear-actions">
+            {checked.length > 0 && (
+              <button className="sb-btn-ghost sb-btn-danger" onClick={onClearChecked}>
+                clear checked items
+              </button>
+            )}
+            {items.length > 0 && (
+              <button
+                className="sb-btn-ghost sb-btn-danger"
+                onClick={() => {
+                  if (window.confirm("Start a new list? This removes everything currently on it.")) {
+                    onClearAll();
+                  }
+                }}
+              >
+                start new list
+              </button>
+            )}
+          </div>
           <button className="sb-btn-ghost" onClick={onClose}>
             close
           </button>
@@ -1759,6 +1835,18 @@ export default function SupperBoard() {
     }
   };
 
+  const toggleHaveAtHome = async (id, haveAtHome) => {
+    setShoppingItems((prev) => prev.map((i) => (i.id === id ? { ...i, haveAtHome } : i)));
+    if (isPreviewSandbox) return;
+    try {
+      await apiUpdateShoppingItemHaveAtHome(id, haveAtHome);
+      setActionError("");
+    } catch (err) {
+      console.error(err);
+      setActionError(err.message);
+    }
+  };
+
   const removeShoppingItem = async (id) => {
     setShoppingItems((prev) => prev.filter((i) => i.id !== id));
     if (isPreviewSandbox) return;
@@ -1777,6 +1865,19 @@ export default function SupperBoard() {
     if (isPreviewSandbox || checkedIds.length === 0) return;
     try {
       await apiDeleteShoppingItems(checkedIds);
+      setActionError("");
+    } catch (err) {
+      console.error(err);
+      setActionError(err.message);
+    }
+  };
+
+  const clearAllShoppingItems = async () => {
+    const allIds = shoppingItems.map((i) => i.id);
+    setShoppingItems([]);
+    if (isPreviewSandbox || allIds.length === 0) return;
+    try {
+      await apiDeleteShoppingItems(allIds);
       setActionError("");
     } catch (err) {
       console.error(err);
@@ -1803,7 +1904,10 @@ export default function SupperBoard() {
     list = list.slice();
     if (boxSort === "name") list.sort((a, b) => a.name.localeCompare(b.name));
     if (boxSort === "rating") list.sort((a, b) => b.rating - a.rating || a.name.localeCompare(b.name));
-    if (boxSort === "time") list.sort((a, b) => a.timeMinutes - b.timeMinutes || a.name.localeCompare(b.name));
+    if (boxSort === "time") {
+      const t = (r) => (r.timeMinutes == null ? Infinity : r.timeMinutes);
+      list.sort((a, b) => t(a) - t(b) || a.name.localeCompare(b.name));
+    }
     return list;
   }, [recipes, boxSearch, boxCuisine, boxProtein, boxTag, boxSort]);
 
@@ -1846,7 +1950,7 @@ export default function SupperBoard() {
               <span className="sb-cart-badge">{shoppingItems.filter((i) => !i.checked).length}</span>
             )}
           </button>
-          {!isPreviewSandbox && (
+          {!isPreviewSandbox && session?.user?.email === ADMIN_EMAIL && (
             <button className="sb-btn-icon" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">
               ⚙
             </button>
@@ -1866,8 +1970,10 @@ export default function SupperBoard() {
           items={shoppingItems}
           onAddItems={addShoppingItems}
           onToggle={toggleShoppingItem}
+          onToggleHaveAtHome={toggleHaveAtHome}
           onRemove={removeShoppingItem}
           onClearChecked={clearCheckedShoppingItems}
+          onClearAll={clearAllShoppingItems}
           days={days}
           calendar={calendar}
           recipeById={recipeById}
@@ -2231,16 +2337,32 @@ const BASE_STYLES = `
     max-height: 280px;
     overflow-y: auto;
   }
+  .sb-shop-col-headers {
+    display: grid;
+    grid-template-columns: 22px 22px 1fr 20px;
+    gap: 10px;
+    padding: 0 4px 6px;
+  }
+  .sb-shop-col-label {
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: #8a8168;
+    text-align: center;
+  }
   .sb-shop-item-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: 22px 22px 1fr 20px;
     align-items: center;
     gap: 10px;
     padding: 9px 4px;
     border-bottom: 1px solid #E4D6AC;
-    cursor: pointer;
   }
-  .sb-shop-item-main { flex: 1; display: flex; flex-direction: column; gap: 1px; }
+  .sb-shop-item-row input[type="checkbox"] { justify-self: center; }
+  .sb-shop-item-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
   .sb-shop-item-text { font-size: 14px; color: var(--ink); }
+  .sb-shop-item-have { color: #8a8168; font-style: italic; }
   .sb-shop-item-sources {
     font-size: 11px;
     color: var(--herb);
@@ -2580,6 +2702,22 @@ const BASE_STYLES = `
     margin-bottom: 14px;
   }
   .sb-field-wide { width: 100%; }
+  .sb-source-link {
+    align-self: flex-start;
+    margin-top: 6px;
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--herb);
+    text-decoration: underline;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+  }
+  .sb-source-link:hover { color: #365e42; }
   .sb-field input, .sb-field select, .sb-field textarea {
     font-family: 'Inter', sans-serif;
     font-size: 14px;
@@ -2634,6 +2772,7 @@ const BASE_STYLES = `
     margin-top: 6px;
   }
   .sb-sheet-actions-right { display: flex; gap: 10px; }
+  .sb-shop-clear-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 
   .sb-quiz-block { margin-bottom: 18px; }
   .sb-quiz-question {
