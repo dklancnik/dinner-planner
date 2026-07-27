@@ -143,6 +143,7 @@ function toDbRecipe(r) {
     source_url: r.sourceUrl,
     rating: r.rating,
     tags: r.tags || [],
+    photo_url: r.photoUrl || null,
   };
 }
 
@@ -158,7 +159,30 @@ function fromDbRecipe(row) {
     sourceUrl: row.source_url || "",
     rating: row.rating || 0,
     tags: row.tags || [],
+    photoUrl: row.photo_url || "",
   };
+}
+
+const RECIPE_PHOTO_BUCKET = "recipe-photos";
+
+// Uploads a photo to Supabase Storage and returns its public URL.
+async function apiUploadRecipePhoto(file, recipeId) {
+  const ext = (file.name.split(".").pop() || "jpg").toLowerCase().replace(/[^a-z0-9]/g, "") || "jpg";
+  const path = `${recipeId}-${Date.now()}.${ext}`;
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${RECIPE_PHOTO_BUCKET}/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${currentAccessToken || SUPABASE_KEY}`,
+      "Content-Type": file.type || "application/octet-stream",
+    },
+    body: file,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.message || `Couldn't upload photo (${res.status})`);
+  }
+  return `${SUPABASE_URL}/storage/v1/object/public/${RECIPE_PHOTO_BUCKET}/${path}`;
 }
 
 async function apiListRecipes() {
@@ -445,6 +469,7 @@ const EMPTY_RECIPE_FORM = {
   sourceUrl: "",
   tags: [],
   rating: 0,
+  photoUrl: "",
 };
 
 // ---------- helpers ----------
@@ -650,7 +675,10 @@ function RecipeCard({ recipe, pinned, onOpen, onRemove, onDragStart, dragging })
           <span className="sb-tag">{recipe.cuisine}</span>
           <span className="sb-tag">{recipe.protein}</span>
         </div>
-        <h4 className="sb-card-title">{recipe.name}</h4>
+        <div className="sb-card-title-row">
+          {recipe.photoUrl && <img src={recipe.photoUrl} alt="" className="sb-card-thumb" />}
+          <h4 className="sb-card-title">{recipe.name}</h4>
+        </div>
         <div className="sb-card-meta">{timeLabel(recipe.timeMinutes)}</div>
         {recipe.tags && recipe.tags.length > 0 && (
           <div className="sb-card-tags">
@@ -690,6 +718,7 @@ function EmptySlot({ onClick, hovered }) {
 // ---------- Add / edit recipe form ----------
 
 function RecipeForm({ initial, onSave, onCancel, onDelete }) {
+  const [recipeId] = useState(() => (initial ? initial.id : "r" + Date.now()));
   const [form, setForm] = useState(
     initial
       ? {
@@ -702,11 +731,14 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
           sourceUrl: initial.sourceUrl || "",
           tags: initial.tags || [],
           rating: initial.rating || 0,
+          photoUrl: initial.photoUrl || "",
         }
       : EMPTY_RECIPE_FORM
   );
   const [tagInput, setTagInput] = useState("");
   const [recipeTab, setRecipeTab] = useState("ingredients"); // "ingredients" | "instructions"
+  const [photoUploading, setPhotoUploading] = useState(false);
+  const [photoError, setPhotoError] = useState("");
 
   const update = (field) => (e) => setForm({ ...form, [field]: e.target.value });
   const isValid = !!form.name.trim();
@@ -726,10 +758,32 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
     setForm({ ...form, tags: form.tags.filter((t) => t !== tag) });
   };
 
+  const handlePhotoChange = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // allow picking the same file again later
+    if (!file) return;
+    setPhotoError("");
+    setPhotoUploading(true);
+    try {
+      if (isPreviewSandbox) {
+        // Storage can't be reached from the chat preview — show it locally instead.
+        setForm((f) => ({ ...f, photoUrl: URL.createObjectURL(file) }));
+      } else {
+        const url = await apiUploadRecipePhoto(file, recipeId);
+        setForm((f) => ({ ...f, photoUrl: url }));
+      }
+    } catch (err) {
+      console.error(err);
+      setPhotoError(err.message);
+    } finally {
+      setPhotoUploading(false);
+    }
+  };
+
   const submit = () => {
     if (!isValid) return;
     onSave({
-      id: initial ? initial.id : "r" + Date.now(),
+      id: recipeId,
       name: form.name.trim(),
       cuisine: form.cuisine,
       protein: form.protein,
@@ -739,6 +793,7 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
       sourceUrl: form.sourceUrl.trim(),
       tags: form.tags,
       rating: form.rating,
+      photoUrl: form.photoUrl,
     });
   };
 
@@ -749,6 +804,40 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
           ×
         </button>
         <h2 className="sb-sheet-title">{initial ? "Edit recipe" : "Add a recipe"}</h2>
+
+        <div className="sb-field sb-field-wide">
+          <span>Photo (optional)</span>
+          <div className="sb-photo-field">
+            {form.photoUrl ? (
+              <img src={form.photoUrl} alt="" className="sb-photo-preview" />
+            ) : (
+              <div className="sb-photo-placeholder">no photo yet</div>
+            )}
+            <div className="sb-photo-actions">
+              <label className="sb-btn-ghost sb-btn-small sb-photo-upload-btn">
+                {photoUploading ? "uploading..." : form.photoUrl ? "change photo" : "add photo"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  onChange={handlePhotoChange}
+                  disabled={photoUploading}
+                  className="sb-visually-hidden"
+                />
+              </label>
+              {form.photoUrl && (
+                <button
+                  type="button"
+                  className="sb-btn-ghost sb-btn-small sb-btn-danger"
+                  onClick={() => setForm({ ...form, photoUrl: "" })}
+                >
+                  remove photo
+                </button>
+              )}
+            </div>
+            {photoError && <p className="sb-login-error" style={{ marginTop: 8 }}>{photoError}</p>}
+          </div>
+        </div>
 
         <label className="sb-field sb-field-wide">
           <span>Found it online? Paste the link (optional)</span>
@@ -3138,6 +3227,54 @@ const BASE_STYLES = `
     cursor: pointer;
   }
   .sb-source-link:hover { color: #365e42; }
+
+  .sb-photo-field {
+    border: 1px solid #D6C89A;
+    border-radius: 6px;
+    padding: 12px;
+    background: #FAFBFD;
+  }
+  .sb-photo-preview {
+    width: 100%;
+    max-height: 220px;
+    object-fit: cover;
+    border-radius: 5px;
+    display: block;
+    margin-bottom: 10px;
+  }
+  .sb-photo-placeholder {
+    width: 100%;
+    height: 90px;
+    border: 2px dashed #D6C89A;
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #a39c82;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 700;
+    margin-bottom: 10px;
+  }
+  .sb-photo-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .sb-photo-upload-btn {
+    display: inline-flex;
+    align-items: center;
+    text-transform: none;
+    letter-spacing: normal;
+    font-weight: 700;
+  }
+
+  .sb-card-title-row { display: flex; align-items: center; gap: 8px; }
+  .sb-card-thumb {
+    width: 36px;
+    height: 36px;
+    border-radius: 6px;
+    object-fit: cover;
+    flex-shrink: 0;
+  }
+
   .sb-field input, .sb-field select, .sb-field textarea {
     font-family: 'Inter', sans-serif;
     font-size: 14px;
@@ -3366,4 +3503,3 @@ const BASE_STYLES = `
     .sb-star { font-size: 19px; padding: 2px; }
   }
 `;
-
