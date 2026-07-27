@@ -228,6 +228,15 @@ async function apiUpdateShoppingItem(id, checked) {
   if (!res.ok) throw new Error(`Couldn't update that item (${res.status})`);
 }
 
+async function apiUpdateShoppingItemSources(id, sources) {
+  const res = await fetch(`${REST}/shopping_list_items?id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: authHeaders(),
+    body: JSON.stringify({ sources }),
+  });
+  if (!res.ok) throw new Error(`Couldn't update that item (${res.status})`);
+}
+
 async function apiDeleteShoppingItem(id) {
   const res = await fetch(`${REST}/shopping_list_items?id=eq.${encodeURIComponent(id)}`, {
     method: "DELETE",
@@ -1156,34 +1165,66 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onRemove, onClearCheck
       return;
     }
 
-    const existingKeys = new Set(items.map((i) => normalizeIngredientKey(i.text)));
-    const seenNew = new Set();
-    const newLines = [];
+    // Existing items, keyed by normalized ingredient — used to merge new
+    // recipe names into items that are already on the list.
+    const existingByKey = new Map(items.map((i) => [normalizeIngredientKey(i.text), i]));
+    const existingSourceSets = new Map(); // item id -> Set(sources), only for items gaining a new source
+    const seenNew = new Map(); // normalized key -> { text, sources: Set<recipeName> }, for brand-new items
+
     chosenRecipes.forEach((r) => {
       parseIngredientLines(r.ingredients).forEach((line) => {
         const key = normalizeIngredientKey(line);
-        if (existingKeys.has(key) || seenNew.has(key)) return;
-        seenNew.add(key);
-        newLines.push(line);
+        const existing = existingByKey.get(key);
+        if (existing) {
+          const set = existingSourceSets.get(existing.id) || new Set(existing.sources || []);
+          set.add(r.name);
+          existingSourceSets.set(existing.id, set);
+          return;
+        }
+        if (seenNew.has(key)) {
+          seenNew.get(key).sources.add(r.name);
+        } else {
+          seenNew.set(key, { text: line, sources: new Set([r.name]) });
+        }
       });
     });
 
-    if (newLines.length === 0) {
+    const newItems = [...seenNew.values()].map((v) => ({
+      id: newShoppingItemId(),
+      text: v.text,
+      checked: false,
+      sources: [...v.sources],
+    }));
+
+    // Only send updates for items whose source list actually grew.
+    const sourceUpdates = [...existingSourceSets.entries()]
+      .map(([id, set]) => ({ id, sources: [...set] }))
+      .filter(({ id, sources }) => {
+        const original = items.find((i) => i.id === id);
+        return !original || sources.length !== (original.sources || []).length;
+      });
+
+    if (newItems.length === 0 && sourceUpdates.length === 0) {
       setNote("Everything from those dinners is already on your list.");
       return;
     }
 
-    const newItems = newLines.map((text) => ({ id: newShoppingItemId(), text, checked: false }));
-    onAddItems(newItems);
+    onAddItems(newItems, sourceUpdates);
     setSelectedDays(new Set());
-    setNote(`Added ${newLines.length} item${newLines.length === 1 ? "" : "s"}.`);
+    const total = newItems.length + sourceUpdates.length;
+    setNote(
+      newItems.length > 0
+        ? `Added ${newItems.length} item${newItems.length === 1 ? "" : "s"}` +
+            (sourceUpdates.length > 0 ? `, updated ${sourceUpdates.length} existing.` : ".")
+        : `Updated ${sourceUpdates.length} existing item${sourceUpdates.length === 1 ? "" : "s"}.`
+    );
   };
 
   const addManualItem = (e) => {
     e.preventDefault();
     const text = manualText.trim();
     if (!text) return;
-    onAddItems([{ id: newShoppingItemId(), text, checked: false }]);
+    onAddItems([{ id: newShoppingItemId(), text, checked: false, sources: [] }]);
     setManualText("");
   };
 
@@ -1254,7 +1295,12 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onRemove, onClearCheck
             {unchecked.map((i) => (
               <label key={i.id} className="sb-shop-item-row">
                 <input type="checkbox" checked={false} onChange={() => onToggle(i.id, true)} />
-                <span className="sb-shop-item-text">{i.text}</span>
+                <span className="sb-shop-item-main">
+                  <span className="sb-shop-item-text">{i.text}</span>
+                  {i.sources && i.sources.length > 0 && (
+                    <span className="sb-shop-item-sources">for {i.sources.join(", ")}</span>
+                  )}
+                </span>
                 <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
                   ×
                 </button>
@@ -1263,7 +1309,12 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onRemove, onClearCheck
             {checked.map((i) => (
               <label key={i.id} className="sb-shop-item-row sb-shop-item-checked">
                 <input type="checkbox" checked={true} onChange={() => onToggle(i.id, false)} />
-                <span className="sb-shop-item-text">{i.text}</span>
+                <span className="sb-shop-item-main">
+                  <span className="sb-shop-item-text">{i.text}</span>
+                  {i.sources && i.sources.length > 0 && (
+                    <span className="sb-shop-item-sources">for {i.sources.join(", ")}</span>
+                  )}
+                </span>
                 <button type="button" className="sb-shop-item-remove" onClick={() => onRemove(i.id)} aria-label="Remove item">
                   ×
                 </button>
@@ -1675,11 +1726,20 @@ export default function SupperBoard() {
 
   const recipeById = (id) => recipes.find((r) => r.id === id);
 
-  const addShoppingItems = async (newItems) => {
-    setShoppingItems((prev) => [...prev, ...newItems]);
+  const addShoppingItems = async (newItems, sourceUpdates = []) => {
+    if (newItems.length > 0) {
+      setShoppingItems((prev) => [...prev, ...newItems]);
+    }
+    if (sourceUpdates.length > 0) {
+      const updateMap = new Map(sourceUpdates.map((u) => [u.id, u.sources]));
+      setShoppingItems((prev) => prev.map((i) => (updateMap.has(i.id) ? { ...i, sources: updateMap.get(i.id) } : i)));
+    }
     if (isPreviewSandbox) return;
     try {
-      await apiInsertShoppingItems(newItems);
+      if (newItems.length > 0) await apiInsertShoppingItems(newItems);
+      if (sourceUpdates.length > 0) {
+        await Promise.all(sourceUpdates.map((u) => apiUpdateShoppingItemSources(u.id, u.sources)));
+      }
       setActionError("");
     } catch (err) {
       console.error(err);
@@ -2179,8 +2239,15 @@ const BASE_STYLES = `
     border-bottom: 1px solid #E4D6AC;
     cursor: pointer;
   }
-  .sb-shop-item-text { flex: 1; font-size: 14px; color: var(--ink); }
+  .sb-shop-item-main { flex: 1; display: flex; flex-direction: column; gap: 1px; }
+  .sb-shop-item-text { font-size: 14px; color: var(--ink); }
+  .sb-shop-item-sources {
+    font-size: 11px;
+    color: var(--herb);
+    font-weight: 600;
+  }
   .sb-shop-item-checked .sb-shop-item-text { text-decoration: line-through; color: #a39c82; }
+  .sb-shop-item-checked .sb-shop-item-sources { color: #b7ae90; }
   .sb-shop-item-remove {
     background: none;
     border: none;
