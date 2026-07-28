@@ -1480,6 +1480,7 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onToggleHaveAtHome, on
   const [selectedDays, setSelectedDays] = useState(() => new Set());
   const [manualText, setManualText] = useState("");
   const [note, setNote] = useState("");
+  const [addSectionOpen, setAddSectionOpen] = useState(true);
 
   const scheduledDays = days.flatMap((d) => {
     const dateKey = isoDate(d);
@@ -1601,37 +1602,49 @@ function ShoppingListPanel({ items, onAddItems, onToggle, onToggleHaveAtHome, on
         <h2 className="sb-sheet-title">Shopping list</h2>
 
         <div className="sb-shop-section">
-          <div className="sb-quiz-question" style={{ marginBottom: 8 }}>
-            Add ingredients from this week's dinners
-          </div>
-          {scheduledDays.length === 0 ? (
-            <p className="sb-empty-note">No dinners scheduled yet — assign some on the calendar first.</p>
-          ) : (
+          <button
+            type="button"
+            className="sb-shop-section-toggle"
+            onClick={() => setAddSectionOpen((open) => !open)}
+            aria-expanded={addSectionOpen}
+          >
+            <span className="sb-quiz-question" style={{ marginBottom: 0 }}>
+              Add ingredients from this week's dinners
+            </span>
+            <span className="sb-shop-section-chevron">{addSectionOpen ? "▾" : "▸"}</span>
+          </button>
+          {addSectionOpen && (
             <>
-              <div className="sb-shop-day-list">
-                {scheduledDays.map((row) => (
-                  <label key={row.key} className="sb-shop-day-row">
-                    <input
-                      type="checkbox"
-                      checked={selectedDays.has(row.key)}
-                      onChange={() => toggleDaySelection(row.key)}
-                    />
-                    <span className="sb-shop-day-label">
-                      {fmtDay(row.d)} {fmtDate(row.d)}
-                    </span>
-                    <span className="sb-shop-day-recipe">{row.recipe.name}</span>
-                  </label>
-                ))}
-              </div>
-              <div className="sb-shop-day-actions">
-                <button type="button" className="sb-btn-ghost sb-btn-small" onClick={selectAllScheduled}>
-                  select all
-                </button>
-                <button type="button" className="sb-btn-solid sb-btn-small" onClick={addFromSelectedDays}>
-                  add ingredients to list
-                </button>
-              </div>
-              {note && <p className="sb-empty-note" style={{ marginTop: 6 }}>{note}</p>}
+              {scheduledDays.length === 0 ? (
+                <p className="sb-empty-note">No dinners scheduled yet — assign some on the calendar first.</p>
+              ) : (
+                <>
+                  <div className="sb-shop-day-list">
+                    {scheduledDays.map((row) => (
+                      <label key={row.key} className="sb-shop-day-row">
+                        <input
+                          type="checkbox"
+                          checked={selectedDays.has(row.key)}
+                          onChange={() => toggleDaySelection(row.key)}
+                        />
+                        <span className="sb-shop-day-label">
+                          {fmtDay(row.d)} {fmtDate(row.d)}
+                        </span>
+                        <span className="sb-shop-day-recipe">{row.recipe.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                  <div className="sb-shop-day-actions">
+                    <button type="button" className="sb-btn-ghost sb-btn-small" onClick={selectAllScheduled}>
+                      select all
+                    </button>
+                    <button type="button" className="sb-btn-solid sb-btn-small" onClick={addFromSelectedDays}>
+                      add ingredients to list
+                    </button>
+                  </div>
+                  {note && <p className="sb-empty-note" style={{ marginTop: 6 }}>{note}</p>}
+                </>
+              )}
             </>
           )}
         </div>
@@ -1886,8 +1899,10 @@ export default function SupperBoard() {
       }
       try {
         const entry = await apiAddAssignment(dropDateStr, recipe.id);
-        setCalendar((prev) => ({ ...prev, [dropDateStr]: [...(prev[dropDateStr] || []), entry] }));
+        const nextList = [...(calendar[dropDateStr] || []), entry];
+        setCalendar((prev) => ({ ...prev, [dropDateStr]: nextList }));
         setActionError("");
+        syncDayToGoogle(dropDateStr, namesForAssignments(nextList));
       } catch (err) {
         console.error(err);
         setActionError(err.message);
@@ -1899,13 +1914,16 @@ export default function SupperBoard() {
     if (sourceStr === dropDateStr) return; // dropped back on itself
 
     // Move just this one assignment from the source day to the destination day.
+    const sourceListBefore = calendarRef.current[sourceStr] || [];
+    const moved = sourceListBefore.find((a) => a.id === assignmentId);
+    const sourceListAfter = sourceListBefore.filter((a) => a.id !== assignmentId);
+    const destListAfter = moved ? [...(calendarRef.current[dropDateStr] || []), moved] : calendarRef.current[dropDateStr] || [];
+
     setCalendar((prev) => {
       const next = { ...prev };
-      const fromList = (next[sourceStr] || []).filter((a) => a.id !== assignmentId);
-      const moved = (prev[sourceStr] || []).find((a) => a.id === assignmentId);
-      if (fromList.length > 0) next[sourceStr] = fromList;
+      if (sourceListAfter.length > 0) next[sourceStr] = sourceListAfter;
       else delete next[sourceStr];
-      if (moved) next[dropDateStr] = [...(next[dropDateStr] || []), moved];
+      if (moved) next[dropDateStr] = destListAfter;
       return next;
     });
 
@@ -1914,6 +1932,8 @@ export default function SupperBoard() {
     try {
       await apiMoveAssignment(assignmentId, dropDateStr);
       setActionError("");
+      syncDayToGoogle(sourceStr, namesForAssignments(sourceListAfter));
+      syncDayToGoogle(dropDateStr, namesForAssignments(destListAfter));
     } catch (err) {
       console.error(err);
       setActionError(err.message);
@@ -2051,11 +2071,21 @@ export default function SupperBoard() {
       return;
     }
     try {
-      const exists = recipes.some((r) => r.id === recipe.id);
+      const existing = recipes.find((r) => r.id === recipe.id);
+      const exists = !!existing;
+      const nameChanged = exists && existing.name !== recipe.name;
       const saved = exists ? await apiUpdateRecipe(recipe) : await apiInsertRecipe(recipe);
       setRecipes((prev) => (exists ? prev.map((r) => (r.id === saved.id ? saved : r)) : [...prev, saved]));
       setEditingRecipe(null);
       setActionError("");
+      if (nameChanged) {
+        const updatedRecipes = recipes.map((r) => (r.id === saved.id ? saved : r));
+        Object.keys(calendar).forEach((date) => {
+          if (calendar[date].some((a) => a.recipeId === saved.id)) {
+            syncDayToGoogle(date, namesForAssignments(calendar[date], updatedRecipes));
+          }
+        });
+      }
     } catch (err) {
       console.error(err);
       setActionError(err.message);
@@ -2080,6 +2110,7 @@ export default function SupperBoard() {
     }
     try {
       const recipeBeingDeleted = recipes.find((r) => r.id === id);
+      const affectedDates = Object.keys(calendar).filter((date) => calendar[date].some((a) => a.recipeId === id));
       await apiDeleteRecipe(id);
       await apiDeleteAssignmentsByRecipe(id);
       if (recipeBeingDeleted?.photoUrl) {
@@ -2089,6 +2120,10 @@ export default function SupperBoard() {
       setCalendar(clearFromCalendar);
       setEditingRecipe(null);
       setActionError("");
+      affectedDates.forEach((date) => {
+        const remainingNames = namesForAssignments(calendar[date].filter((a) => a.recipeId !== id));
+        syncDayToGoogle(date, remainingNames);
+      });
     } catch (err) {
       console.error(err);
       setActionError(err.message);
@@ -2123,10 +2158,12 @@ export default function SupperBoard() {
     }
     try {
       const entry = await apiAddAssignment(key, recipe.id);
-      setCalendar((prev) => ({ ...prev, [key]: [...(prev[key] || []), entry] }));
+      const nextList = [...(calendar[key] || []), entry];
+      setCalendar((prev) => ({ ...prev, [key]: nextList }));
       setAssignDate(null);
       setQuizForDate(null);
       setActionError("");
+      syncDayToGoogle(key, namesForAssignments(nextList));
     } catch (err) {
       console.error(err);
       setActionError(err.message);
@@ -2136,10 +2173,11 @@ export default function SupperBoard() {
   // Removes one specific recipe from one specific day (not the whole day).
   const removeAssignment = async (date, assignmentId) => {
     const key = isoDate(date);
+    const nextList = (calendar[key] || []).filter((a) => a.id !== assignmentId);
     const applyLocal = (prev) => {
       const next = { ...prev };
-      next[key] = (next[key] || []).filter((a) => a.id !== assignmentId);
-      if (next[key].length === 0) delete next[key];
+      if (nextList.length > 0) next[key] = nextList;
+      else delete next[key];
       return next;
     };
     if (isPreviewSandbox) {
@@ -2150,6 +2188,7 @@ export default function SupperBoard() {
       await apiRemoveAssignment(assignmentId);
       setCalendar(applyLocal);
       setActionError("");
+      syncDayToGoogle(key, namesForAssignments(nextList));
     } catch (err) {
       console.error(err);
       setActionError(err.message);
@@ -2157,6 +2196,23 @@ export default function SupperBoard() {
   };
 
   const recipeById = (id) => recipes.find((r) => r.id === id);
+
+  // Fire-and-forget sync to Google Calendar — never blocks the UI or the
+  // in-app action if it fails; errors just get logged.
+  const syncDayToGoogle = (dateKey, names) => {
+    if (isPreviewSandbox) return; // no /api routes reachable from the chat preview
+    fetch("/api/sync-calendar", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${currentAccessToken || ""}` },
+      body: JSON.stringify({ date: dateKey, recipeNames: names }),
+    }).catch((err) => console.error("Google Calendar sync failed:", err));
+  };
+
+  const namesForAssignments = (assignments, recipesList) =>
+    assignments
+      .map((a) => (recipesList || recipes).find((r) => r.id === a.recipeId))
+      .filter(Boolean)
+      .map((r) => r.name);
 
   const addShoppingItems = async (newItems, sourceUpdates = []) => {
     if (newItems.length > 0) {
@@ -2701,6 +2757,24 @@ const BASE_STYLES = `
     border: 1px solid #E4D6AC;
     border-radius: 6px;
     padding: 16px;
+  }
+  .sb-shop-section-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    background: none;
+    border: none;
+    padding: 0;
+    margin-bottom: 8px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .sb-shop-section-chevron {
+    color: var(--herb);
+    font-size: 12px;
+    flex-shrink: 0;
+    margin-left: 8px;
   }
   .sb-shop-day-list {
     display: flex;
