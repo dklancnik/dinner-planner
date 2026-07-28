@@ -682,7 +682,7 @@ function RecipeCard({ recipe, pinned, onOpen, onRemove, onDragStart, dragging })
       className={"sb-card" + (pinned ? " sb-card-pinned" : "") + (dragging ? " sb-card-dragging" : "")}
       onClick={() => onOpen(recipe)}
       onPointerDown={
-        onDragStart
+        pinned && onDragStart
           ? (e) => {
               if (e.target.closest(".sb-card-remove, .sb-star")) return;
               onDragStart(e, recipe);
@@ -726,6 +726,16 @@ function RecipeCard({ recipe, pinned, onOpen, onRemove, onDragStart, dragging })
         >
           remove
         </button>
+      )}
+      {!pinned && onDragStart && (
+        <div
+          className="sb-card-drag-handle"
+          onPointerDown={(e) => onDragStart(e, recipe)}
+          aria-label="Drag to a day on the calendar"
+          title="Drag to a day"
+        >
+          ⠿
+        </div>
       )}
     </div>
   );
@@ -2438,14 +2448,16 @@ export default function SupperBoard() {
             const idx = assignments.length ? Math.min(rawIdx, assignments.length - 1) : 0;
             const current = assignments[idx];
             const recipe = current ? recipeById(current.recipeId) : null;
-            const isToday = key === isoDate(new Date());
+            const todayKey = isoDate(new Date());
+            const isToday = key === todayKey;
+            const isPast = key < todayKey;
             const draggingFromThisDay = dragActiveKey && dragActiveKey.startsWith("day-" + key + "-");
             const isHovered = hoverDate === key && !draggingFromThisDay;
             return (
               <div
                 key={key}
-                className={"sb-day-col" + (isHovered ? " sb-day-col-hover" : "")}
-                data-drop-date={key}
+                className={"sb-day-col" + (isHovered ? " sb-day-col-hover" : "") + (isPast ? " sb-day-col-past" : "")}
+                data-drop-date={isPast ? undefined : key}
               >
                 <div className={"sb-day-label" + (isToday ? " sb-day-label-today" : "")}>
                   <span className="sb-day-name">{fmtDay(d)}</span>
@@ -2492,10 +2504,14 @@ export default function SupperBoard() {
                         </button>
                       </div>
                     )}
-                    <button type="button" className="sb-day-add-more" onClick={() => setAssignDate(d)}>
-                      + add another
-                    </button>
+                    {!isPast && (
+                      <button type="button" className="sb-day-add-more" onClick={() => setAssignDate(d)}>
+                        + add another
+                      </button>
+                    )}
                   </div>
+                ) : isPast ? (
+                  <div className="sb-slot-past">no dinner</div>
                 ) : (
                   <EmptySlot onClick={() => setAssignDate(d)} hovered={isHovered} />
                 )}
@@ -3005,6 +3021,21 @@ const BASE_STYLES = `
     outline-offset: 4px;
     border-radius: 8px;
   }
+  .sb-day-col-past { opacity: 0.55; }
+  .sb-slot-past {
+    width: 100%;
+    min-height: 150px;
+    border: 2px dashed rgba(58,42,22,0.25);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(58,42,22,0.4);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
   .sb-day-label {
     display: flex;
     flex-direction: column;
@@ -3052,15 +3083,37 @@ const BASE_STYLES = `
     border-radius: 4px;
     padding: 14px 14px 14px 26px;
     position: relative;
-    cursor: grab;
+    cursor: pointer;
     width: 100%;
     box-shadow: 0 1px 2px rgba(0,0,0,0.08);
-    touch-action: none;
+    touch-action: manipulation;
     user-select: none;
     -webkit-user-select: none;
     -webkit-touch-callout: none;
     -webkit-tap-highlight-color: transparent;
   }
+  .sb-card-pinned {
+    cursor: grab;
+    touch-action: none;
+  }
+  .sb-card-drag-handle {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    color: #8a8168;
+    font-size: 16px;
+    cursor: grab;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .sb-card-drag-handle:hover { background: rgba(79,122,91,0.1); color: var(--herb); }
   .sb-card * {
     -webkit-user-select: none;
     -webkit-touch-callout: none;
@@ -3582,6 +3635,7 @@ const BASE_STYLES = `
       flex-direction: row;
       gap: 8px;
     }
+    .sb-slot-past { flex: 1; min-height: 64px; }
     .sb-card { width: 100%; }
     .sb-day-card-stack { flex: 1; min-width: 0; }
     .sb-card-pinned {
