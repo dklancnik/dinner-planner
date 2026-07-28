@@ -512,6 +512,9 @@ function nextTwoWeeks() {
   const days = [];
   const start = new Date();
   start.setHours(0, 0, 0, 0);
+  const dayOfWeek = start.getDay(); // 0 = Sunday ... 6 = Saturday
+  const daysSinceMonday = (dayOfWeek + 6) % 7; // Monday = 0 ... Sunday = 6
+  start.setDate(start.getDate() - daysSinceMonday);
   for (let i = 0; i < 14; i++) {
     const d = new Date(start);
     d.setDate(start.getDate() + i);
@@ -1861,10 +1864,19 @@ export default function SupperBoard() {
     }
   };
 
+  // Backup for iOS Safari, where preventDefault() inside a pointermove
+  // handler doesn't always reliably suppress the native scroll gesture the
+  // way it does in other browsers. This blocks scrolling directly via the
+  // underlying touch event once a drag is in progress.
+  const blockTouchScroll = (e) => {
+    if (dragRef.current) e.preventDefault();
+  };
+
   const cleanupDragListeners = () => {
     document.removeEventListener("pointermove", onDocPointerMove);
     document.removeEventListener("pointerup", onDocPointerUp);
     document.removeEventListener("pointercancel", onDocPointerUp);
+    document.removeEventListener("touchmove", blockTouchScroll);
   };
 
   const endDragVisuals = () => {
@@ -2011,6 +2023,9 @@ export default function SupperBoard() {
     document.addEventListener("pointermove", onDocPointerMove);
     document.addEventListener("pointerup", onDocPointerUp);
     document.addEventListener("pointercancel", onDocPointerUp);
+    if (isTouch) {
+      document.addEventListener("touchmove", blockTouchScroll, { passive: false });
+    }
 
     if (isTouch) {
       dragSession.holdTimer = window.setTimeout(() => {
@@ -3519,7 +3534,7 @@ const BASE_STYLES = `
 
   /* ---------- Mobile (iPhone-width) overrides ---------- */
   * { -webkit-tap-highlight-color: transparent; }
-  .sb-card, .sb-slot-empty, .sb-chip, .sb-btn-solid, .sb-btn-ghost, .sb-btn-ghost-light, .sb-btn-icon, .sb-star, .sb-quiz-result {
+  .sb-slot-empty, .sb-chip, .sb-btn-solid, .sb-btn-ghost, .sb-btn-ghost-light, .sb-btn-icon, .sb-star, .sb-quiz-result {
     touch-action: manipulation;
   }
 
