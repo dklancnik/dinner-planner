@@ -774,6 +774,9 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
   const [recipeTab, setRecipeTab] = useState("ingredients"); // "ingredients" | "instructions"
   const [photoUploading, setPhotoUploading] = useState(false);
   const [photoError, setPhotoError] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState("");
+  const [importNote, setImportNote] = useState("");
 
   const update = (field) => (e) => setForm({ ...form, [field]: e.target.value });
   const isValid = !!form.name.trim();
@@ -812,6 +815,47 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
       setPhotoError(err.message);
     } finally {
       setPhotoUploading(false);
+    }
+  };
+
+  const handleImport = async () => {
+    const url = form.sourceUrl.trim();
+    if (!url) return;
+    setImportError("");
+    setImportNote("");
+    if (isPreviewSandbox) {
+      setImportError("Importing needs the real deployed app — this preview can't reach outside websites.");
+      return;
+    }
+    setImporting(true);
+    try {
+      const res = await fetch("/api/import-recipe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${currentAccessToken || ""}` },
+        body: JSON.stringify({ url: normalizeUrl(url) }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Couldn't import that recipe.");
+      const r = data.recipe;
+      const importedIngredients =
+        r.ingredients && r.ingredients.length
+          ? r.ingredients
+              .map((i) => `- ${i.replace(/,/g, "").replace(/\s+/g, " ").trim()}`)
+              .join("\n")
+          : "";
+      setForm((f) => ({
+        ...f,
+        name: f.name.trim() ? f.name : r.name || f.name,
+        ingredients: f.ingredients.trim() ? f.ingredients : importedIngredients || f.ingredients,
+        instructions: f.instructions.trim() ? f.instructions : r.instructions || f.instructions,
+        timeMinutes: f.timeMinutes.trim() ? f.timeMinutes : r.timeMinutes ? String(r.timeMinutes) : f.timeMinutes,
+        photoUrl: f.photoUrl ? f.photoUrl : r.photoUrl || f.photoUrl,
+      }));
+      setImportNote("Imported! Double check everything looks right before saving.");
+    } catch (err) {
+      setImportError(err.message);
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -885,15 +929,24 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
         <label className="sb-field sb-field-wide">
           <span>Found it online? Paste the link (optional)</span>
           <input value={form.sourceUrl} onChange={update("sourceUrl")} placeholder="https://..." />
-          {form.sourceUrl.trim() && (
-            <button
-              type="button"
-              className="sb-source-link"
-              onClick={() => window.open(normalizeUrl(form.sourceUrl.trim()), "_blank", "noopener,noreferrer")}
-            >
-              open link ↗
-            </button>
-          )}
+          <div className="sb-url-actions">
+            {form.sourceUrl.trim() && (
+              <button
+                type="button"
+                className="sb-source-link"
+                onClick={() => window.open(normalizeUrl(form.sourceUrl.trim()), "_blank", "noopener,noreferrer")}
+              >
+                open link ↗
+              </button>
+            )}
+            {form.sourceUrl.trim() && (
+              <button type="button" className="sb-btn-solid sb-btn-small" onClick={handleImport} disabled={importing}>
+                {importing ? "importing..." : "import recipe →"}
+              </button>
+            )}
+          </div>
+          {importNote && <p className="sb-import-note">{importNote}</p>}
+          {importError && <p className="sb-login-error" style={{ marginTop: 8 }}>{importError}</p>}
         </label>
 
         <label className="sb-field sb-field-wide">
@@ -1156,6 +1209,9 @@ function AssignPanel({ date, recipes, onAssign, onClose, onOpenQuiz }) {
   return (
     <div className="sb-modal-backdrop" onClick={onClose}>
       <div className="sb-sheet" onClick={(e) => e.stopPropagation()}>
+        <button type="button" className="sb-sheet-close" onClick={onClose} aria-label="Close">
+          ×
+        </button>
         <div className="sb-eyebrow">assigning dinner</div>
         <h2 className="sb-sheet-title">{dateLabel}</h2>
 
@@ -1183,13 +1239,6 @@ function AssignPanel({ date, recipes, onAssign, onClose, onOpenQuiz }) {
               <button className="sb-btn-solid sb-btn-small">assign</button>
             </div>
           ))}
-        </div>
-
-        <div className="sb-sheet-actions">
-          <div />
-          <button className="sb-btn-ghost" onClick={onClose}>
-            close
-          </button>
         </div>
       </div>
     </div>
@@ -3387,9 +3436,13 @@ const BASE_STYLES = `
     margin-bottom: 14px;
   }
   .sb-field-wide { width: 100%; }
-  .sb-source-link {
-    align-self: flex-start;
+  .sb-url-actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
     margin-top: 6px;
+  }
+  .sb-source-link {
     font-family: 'Inter', sans-serif;
     font-size: 12px;
     font-weight: 700;
@@ -3403,6 +3456,12 @@ const BASE_STYLES = `
     cursor: pointer;
   }
   .sb-source-link:hover { color: #365e42; }
+  .sb-import-note {
+    font-size: 12px;
+    color: var(--herb);
+    font-weight: 600;
+    margin: 8px 0 0;
+  }
 
   .sb-photo-field {
     border: 1px solid #D6C89A;
