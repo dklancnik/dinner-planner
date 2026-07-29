@@ -2702,6 +2702,10 @@ export default function SupperBoard() {
 const BASE_STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@500;600;700&family=Inter:wght@400;500;600;700&family=Caveat:wght@500;600&display=swap');
 
+  .sb-app, .sb-app *, .sb-app *::before, .sb-app *::after {
+    box-sizing: border-box;
+  }
+
   .sb-app {
     --chalk: #2B3A32;
     --card: #F5EAC8;
