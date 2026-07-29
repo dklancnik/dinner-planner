@@ -723,8 +723,10 @@ function RecipeCard({ recipe, pinned, onOpen, onRemove, onDragStart, dragging })
             e.stopPropagation();
             onRemove();
           }}
+          aria-label="Remove this recipe from the day"
+          title="Remove"
         >
-          remove
+          ×
         </button>
       )}
       {!pinned && onDragStart && (
@@ -3264,17 +3266,24 @@ const BASE_STYLES = `
   .sb-star { color: #D8CBA0; }
   .sb-star-filled { color: var(--marigold); }
   .sb-card-remove {
-    margin-top: 6px;
-    background: none;
-    border: none;
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255,255,255,0.85);
+    border: 1px solid rgba(193,68,46,0.3);
+    border-radius: 50%;
     color: var(--tomato);
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
+    font-size: 18px;
+    line-height: 1;
     cursor: pointer;
-    padding: 0;
+    touch-action: manipulation;
   }
+  .sb-card-remove:hover { background: #fff; border-color: var(--tomato); }
 
   .sb-day-card-stack {
     display: flex;
