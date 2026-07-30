@@ -144,6 +144,7 @@ function toDbRecipe(r) {
     rating: r.rating,
     tags: r.tags || [],
     photo_url: r.photoUrl || null,
+    photos: r.photos || [],
   };
 }
 
@@ -160,6 +161,7 @@ function fromDbRecipe(row) {
     rating: row.rating || 0,
     tags: row.tags || [],
     photoUrl: row.photo_url || "",
+    photos: row.photos || [],
   };
 }
 
@@ -492,6 +494,7 @@ const EMPTY_RECIPE_FORM = {
   tags: [],
   rating: 0,
   photoUrl: "",
+  photos: [],
 };
 
 // ---------- helpers ----------
@@ -769,16 +772,20 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
           tags: initial.tags || [],
           rating: initial.rating || 0,
           photoUrl: initial.photoUrl || "",
+          photos: initial.photos || [],
         }
       : EMPTY_RECIPE_FORM
   );
   const [tagInput, setTagInput] = useState("");
-  const [recipeTab, setRecipeTab] = useState("ingredients"); // "ingredients" | "instructions"
+  const [recipeTab, setRecipeTab] = useState("ingredients"); // "ingredients" | "instructions" | "photos"
   const [photoUploading, setPhotoUploading] = useState(false);
   const [photoError, setPhotoError] = useState("");
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState("");
   const [importNote, setImportNote] = useState("");
+  const [galleryUploading, setGalleryUploading] = useState(false);
+  const [galleryError, setGalleryError] = useState("");
+  const [viewingPhoto, setViewingPhoto] = useState(null);
 
   const update = (field) => (e) => setForm({ ...form, [field]: e.target.value });
   const isValid = !!form.name.trim();
@@ -817,6 +824,37 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
       setPhotoError(err.message);
     } finally {
       setPhotoUploading(false);
+    }
+  };
+
+  const handleGalleryPhotosChange = async (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = ""; // allow picking the same file(s) again later
+    if (files.length === 0) return;
+    setGalleryError("");
+    setGalleryUploading(true);
+    try {
+      for (const file of files) {
+        if (isPreviewSandbox) {
+          const localUrl = URL.createObjectURL(file);
+          setForm((f) => ({ ...f, photos: [...f.photos, localUrl] }));
+        } else {
+          const url = await apiUploadRecipePhoto(file, recipeId);
+          setForm((f) => ({ ...f, photos: [...f.photos, url] }));
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      setGalleryError(err.message);
+    } finally {
+      setGalleryUploading(false);
+    }
+  };
+
+  const removeGalleryPhoto = (url) => {
+    setForm((f) => ({ ...f, photos: f.photos.filter((p) => p !== url) }));
+    if (!isPreviewSandbox) {
+      apiDeleteRecipePhoto(url); // best-effort cleanup, doesn't need to block the UI
     }
   };
 
@@ -875,6 +913,7 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
       tags: form.tags,
       rating: form.rating,
       photoUrl: form.photoUrl,
+      photos: form.photos,
     });
   };
 
@@ -998,9 +1037,16 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
           >
             Instructions
           </button>
+          <button
+            type="button"
+            className={"sb-recipe-tab" + (recipeTab === "photos" ? " sb-recipe-tab-active" : "")}
+            onClick={() => setRecipeTab("photos")}
+          >
+            Photos{form.photos.length > 0 ? ` (${form.photos.length})` : ""}
+          </button>
         </div>
 
-        {recipeTab === "ingredients" ? (
+        {recipeTab === "ingredients" && (
           <label className="sb-field sb-field-wide">
             <span className="sb-visually-hidden">Ingredients</span>
             <textarea
@@ -1013,7 +1059,9 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
               autoFocus
             />
           </label>
-        ) : (
+        )}
+
+        {recipeTab === "instructions" && (
           <label className="sb-field sb-field-wide">
             <span className="sb-visually-hidden">Instructions (optional)</span>
             <textarea
@@ -1026,6 +1074,51 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
               autoFocus
             />
           </label>
+        )}
+
+        {recipeTab === "photos" && (
+          <div className="sb-field sb-field-wide">
+            <span className="sb-visually-hidden">Photos of the recipe (e.g. from a cookbook)</span>
+            <p className="sb-photos-tab-hint">
+              Snap photos of a recipe book page here for reference — this is just backup, separate from typing out
+              ingredients and instructions above.
+            </p>
+            {form.photos.length > 0 && (
+              <div className="sb-photo-gallery">
+                {form.photos.map((url) => (
+                  <div key={url} className="sb-photo-gallery-thumb-wrap">
+                    <img
+                      src={url}
+                      alt=""
+                      className="sb-photo-gallery-thumb"
+                      onClick={() => setViewingPhoto(url)}
+                    />
+                    <button
+                      type="button"
+                      className="sb-photo-gallery-remove"
+                      onClick={() => removeGalleryPhoto(url)}
+                      aria-label="Remove this photo"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <label className="sb-btn-ghost sb-btn-small sb-photo-upload-btn">
+              {galleryUploading ? "uploading..." : "+ take or add photos"}
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                multiple
+                onChange={handleGalleryPhotosChange}
+                disabled={galleryUploading}
+                className="sb-visually-hidden"
+              />
+            </label>
+            {galleryError && <p className="sb-login-error" style={{ marginTop: 8 }}>{galleryError}</p>}
+          </div>
         )}
 
         <label className="sb-field sb-field-wide">
@@ -1083,6 +1176,20 @@ function RecipeForm({ initial, onSave, onCancel, onDelete }) {
           </div>
         </div>
       </div>
+
+      {viewingPhoto && (
+        <div className="sb-photo-lightbox" onClick={() => setViewingPhoto(null)}>
+          <button
+            type="button"
+            className="sb-photo-lightbox-close"
+            onClick={() => setViewingPhoto(null)}
+            aria-label="Close"
+          >
+            ×
+          </button>
+          <img src={viewingPhoto} alt="" className="sb-photo-lightbox-img" onClick={(e) => e.stopPropagation()} />
+        </div>
+      )}
     </div>
   );
 }
@@ -2191,6 +2298,9 @@ export default function SupperBoard() {
       await apiDeleteAssignmentsByRecipe(id);
       if (recipeBeingDeleted?.photoUrl) {
         apiDeleteRecipePhoto(recipeBeingDeleted.photoUrl); // best-effort, not awaited-critical
+      }
+      if (recipeBeingDeleted?.photos && recipeBeingDeleted.photos.length > 0) {
+        recipeBeingDeleted.photos.forEach((url) => apiDeleteRecipePhoto(url)); // best-effort, not awaited-critical
       }
       setRecipes((prev) => prev.filter((r) => r.id !== id));
       setCalendar(clearFromCalendar);
@@ -3513,6 +3623,79 @@ const BASE_STYLES = `
     letter-spacing: normal;
     font-weight: 700;
   }
+
+  .sb-photos-tab-hint {
+    font-size: 12px;
+    color: #8a8168;
+    margin: 0 0 14px;
+    line-height: 1.5;
+  }
+  .sb-photo-gallery {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+  .sb-photo-gallery-thumb-wrap {
+    position: relative;
+    aspect-ratio: 1;
+  }
+  .sb-photo-gallery-thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid #D6C89A;
+    cursor: pointer;
+    display: block;
+  }
+  .sb-photo-gallery-remove {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--tomato);
+    color: #fff;
+    border: 2px solid #FBF6E4;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .sb-photo-lightbox {
+    position: fixed;
+    inset: 0;
+    background: rgba(20,16,8,0.9);
+    z-index: 300;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+  }
+  .sb-photo-lightbox-img {
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 6px;
+    box-shadow: 0 12px 30px rgba(0,0,0,0.4);
+  }
+  .sb-photo-lightbox-close {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.15);
+    color: #fff;
+    border: none;
+    font-size: 22px;
+    cursor: pointer;
+  }
+  .sb-photo-lightbox-close:hover { background: rgba(255,255,255,0.25); }
 
   .sb-card-title-row { display: flex; align-items: center; gap: 8px; }
   .sb-card-thumb {
